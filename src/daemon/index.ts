@@ -393,6 +393,11 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     const approvalDelivery = new ApprovalDelivery();
     const deferredExecutor = new DeferredExecutor(approvalManager, auditTrail);
     deferredExecutor.setLearner(learner);
+    // Phase 6.3.5b — let WS service resolve approvals from voice intents.
+    wsService.setApprovalManager(approvalManager);
+    wsService.setDeferredExecutor(deferredExecutor);
+    // Voice-channel audit tagging for forensic separation from click path.
+    wsService.setAuditTrail(auditTrail);
 
     // Restore emergency state from config
     const savedEmergencyState = authorityConfig.emergency_state ?? 'normal';
@@ -477,6 +482,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
 
     // 9b. Set up API routes + dashboard static files
     const apiContext: import('./api-routes.ts').ApiContext & Record<string, unknown> = {
+      daemonStartedAt: Date.now(),
       healthMonitor,
       agentService,
       config: jarvisConfig,
@@ -525,35 +531,70 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     const toolRegistry = orchestrator.getToolRegistry();
     if (toolRegistry) {
       deferredExecutor.setToolRegistry(toolRegistry);
+
+      // Register the request_approval intent-gating tool now that approval
+      // infrastructure is wired. Registered here (not in agent-service) because
+      // the tool needs both approvalManager and approvalDelivery, which are
+      // owned by the daemon composition root.
+      const { createRequestApprovalTool } = await import('../actions/tools/approval-tool.ts');
+      const requestApprovalTool = createRequestApprovalTool({
+        approvalManager,
+        approvalDelivery,
+        getCurrentAgent: () => {
+          const primary = orchestrator.getPrimary();
+          if (!primary) return null;
+          return { id: primary.id, name: primary.agent.role.name };
+        },
+      });
+      if (!toolRegistry.has('request_approval')) {
+        toolRegistry.register(requestApprovalTool);
+        console.log('[Daemon] Registered request_approval intent-gate tool');
+      }
     }
     approvalDelivery.setBroadcaster(wsService);
     approvalDelivery.setChannelSender(channelService);
     deferredExecutor.setResultCallback((requestId, request, result) => {
-      // Notify via WS and channels that an approved action was executed
+      // Notify via WS and channels that an approved action was executed.
+      // Skip for intent-only approvals — they have no deferred execution.
+      if (request.tool_name === 'request_approval') return;
       const text = `[EXECUTED] ${request.tool_name}: ${result.slice(0, 200)}`;
       wsService.broadcastNotification(text, 'normal');
     });
 
+    // Phase A — onboarding setup-mode guard for LLM-dependent services.
+    // While `setup_completed_at === null` the user hasn't saved an LLM
+    // provider/key/model yet, so the heartbeat-driven background agent,
+    // commitment executor, and awareness service all have nothing to
+    // call. Skip them to keep the logs clean; they spin up on the next
+    // daemon restart after the user finishes the setup screens.
+    const inSetupMode = !jarvisConfig.onboarding?.setup_completed_at;
+    if (inSetupMode) {
+      console.log('[Daemon] Setup mode — skipping bgAgent / executor / awareness until first-run setup completes');
+    }
+
     // 10b. Create and start background agent (needs LLM providers from agentService.start())
-    const bgAgentService = new BackgroundAgentService(jarvisConfig, agentService.getLLMManager());
-    bgAgentService.setResearchQueue(researchQueue);
-    await bgAgentService.start();
-    bgAgent = bgAgentService;
-    console.log('[Daemon] Background agent started (separate browser for heartbeat/reactions)');
+    if (!inSetupMode) {
+      const bgAgentService = new BackgroundAgentService(jarvisConfig, agentService.getLLMManager());
+      bgAgentService.setResearchQueue(researchQueue);
+      await bgAgentService.start();
+      bgAgent = bgAgentService;
+      console.log('[Daemon] Background agent started (separate browser for heartbeat/reactions)');
 
-    // 10c. Wire reactor + executor to background agent (separate browser, no chat contention)
-    reactor.setAgentService(bgAgentService);
-    executor.setAgentService(bgAgentService);
+      // 10c. Wire reactor + executor to background agent (separate browser, no chat contention)
+      reactor.setAgentService(bgAgentService);
+      executor.setAgentService(bgAgentService);
 
-    // 10d. Wire executor broadcast (needs wsServer running) and start
-    executor.setBroadcast((msg) => wsService.getServer().broadcast(msg));
-    wsService.setCommitmentExecutor(executor);
-    executor.start();
-    commitmentExecutor = executor;
+      // 10d. Wire executor broadcast (needs wsServer running) and start
+      executor.setBroadcast((msg) => wsService.getServer().broadcast(msg));
+      wsService.setCommitmentExecutor(executor);
+      executor.start();
+      commitmentExecutor = executor;
+    }
 
     // 10e. Create and start Awareness Service (M13)
     //       Skipped when --no-local-tools is set (headless / Docker)
-    if (jarvisConfig.awareness?.enabled !== false && !config.noLocalTools) {
+    //       Also skipped in setup mode (no LLM yet).
+    if (!inSetupMode && jarvisConfig.awareness?.enabled !== false && !config.noLocalTools) {
       try {
         const { AwarenessService } = await import('../awareness/service.ts');
         const svc = new AwarenessService(
@@ -1008,8 +1049,14 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         // Flush coalesced events for heartbeat
         const coalescedSummary = coalescer.flush();
 
+        // Setup mode = no bgAgent. Skip the heartbeat entirely.
+        if (!bgAgent) {
+          heartbeatBusy = false;
+          return;
+        }
+
         // Run heartbeat on BACKGROUND agent with timeout to prevent stuck busy lock
-        const heartbeatPromise = bgAgentService.handleHeartbeat(
+        const heartbeatPromise = bgAgent.handleHeartbeat(
           coalescedSummary || undefined
         );
         const timeoutPromise = new Promise<null>((resolve) =>

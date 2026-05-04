@@ -11,10 +11,16 @@ function safeCompare(a: string, b: string): boolean {
 
 export type WSMessage = {
   type: 'chat' | 'command' | 'status' | 'stream' | 'error' | 'notification'
-      | 'tts_start' | 'tts_end' | 'voice_start' | 'voice_end'
+      | 'tts_start' | 'tts_text' | 'tts_end' | 'voice_start' | 'voice_end' | 'voice_text'
+      | 'interview_start' | 'interview_user_message' | 'interview_assistant' | 'interview_done' | 'interview_error'
+      | 'thinking_start' | 'thinking_end'
       | 'workflow_event'
       | 'goal_event'
-      | 'site_event';
+      | 'site_event'
+      // Emitted when a pending voice confirmation (clarifier / repeat-back)
+      // expires from the server-side TTL sweep. Payload: { id: string }.
+      // Clients should dismiss the corresponding card from their UI.
+      | 'voice_confirmation_expired';
   payload: unknown;
   id?: string;
   priority?: 'urgent' | 'normal' | 'low';

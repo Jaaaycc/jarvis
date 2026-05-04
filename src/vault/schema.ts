@@ -383,6 +383,10 @@ function createTables(db: Database): void {
   db.run(`CREATE INDEX IF NOT EXISTS idx_audit_agent ON audit_trail(agent_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_audit_category ON audit_trail(action_category)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_trail(created_at)`);
+  // Migration: tag the resolution channel ('click' | 'voice' | 'system' | null).
+  // Useful forensics if a voice misfire ever resolves something it shouldn't.
+  // Column is nullable so existing rows remain valid; new rows specify it.
+  try { db.run(`ALTER TABLE audit_trail ADD COLUMN channel TEXT`); } catch {}
 
   // Authority: Approval patterns (for learning)
   db.run(`
@@ -696,4 +700,44 @@ function createTables(db: Database): void {
   if (!webappCols.some((c) => c.name === 'keywords')) {
     db.run(`ALTER TABLE webapp_templates ADD COLUMN keywords TEXT NOT NULL DEFAULT '[]'`);
   }
+
+  // Recent objects: cross-device LRU of palette picks. The dashboard primarily
+  // reads `picked_at` desc and dedupes on (object_type, object_id) so the same
+  // pick repeated bumps the timestamp instead of accumulating rows.
+  // Capped externally — the API trims to 50 most-recent on insert.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS recent_objects (
+      id TEXT PRIMARY KEY,
+      object_type TEXT NOT NULL,
+      object_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT,
+      meta TEXT,
+      picked_at INTEGER NOT NULL,
+      UNIQUE(object_type, object_id)
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_recent_objects_picked ON recent_objects(picked_at DESC)`);
+
+  // Agent activity history (Phase 6.3 — Agents Room).
+  // Persisted snapshot of `subAgentEvents` so the dashboard can show a
+  // per-agent activity timeline that survives reload. Today these events
+  // only stream over WS — empty state on first paint after a refresh
+  // wasn't acceptable for a "what's this agent doing" Room.
+  // Bounded growth: trimmed externally on insert (most recent 1000 per
+  // agent kept). `data` is JSON-stringified payload.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS agent_activity (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      agent_name TEXT NOT NULL,
+      event_type TEXT NOT NULL CHECK(event_type IN ('text', 'tool_call', 'done')),
+      data TEXT,
+      task_id TEXT,
+      timestamp INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_agent_activity_agent_id ON agent_activity(agent_id, timestamp DESC)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_agent_activity_timestamp ON agent_activity(timestamp DESC)`);
 }

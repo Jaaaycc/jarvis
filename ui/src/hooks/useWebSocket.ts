@@ -85,7 +85,12 @@ export type AgentActivityEvent = {
 
 export type VoiceCallbacks = {
   onTTSBinary: (data: ArrayBuffer) => void;
-  onTTSStart: (requestId: string) => void;
+  /** `containsWake` — true if the TTS sentence about to play contains
+   *  "Jarvis". UI uses it to suppress the wake-word recognizer for the
+   *  duration of the playback so TTS doesn't self-trigger via mic echo. */
+  onTTSStart: (requestId: string, containsWake: boolean) => void;
+  /** Mid-turn flip: a later sentence in the same turn contains "Jarvis". */
+  onTTSContainsWake?: () => void;
   onTTSEnd: () => void;
   onError: (message?: string) => void;
 };
@@ -118,6 +123,43 @@ export type SystemNotice = {
   title: string;
   text: string;
   level: "warning";
+};
+
+export type ApprovalImpact = "read" | "write" | "destructive" | "external";
+
+export type PendingApproval = {
+  id: string;
+  shortId: string;
+  intent: string;
+  category: string;
+  impact: ApprovalImpact;
+  agentName: string;
+  toolName: string;
+  urgency: "urgent" | "normal";
+  reason: string;
+  timestamp: number;
+};
+
+export type VoiceIntentLite = {
+  label: string;
+  verb: string;
+  impact: ApprovalImpact;
+};
+
+export type PendingClarifier = {
+  id: string;
+  transcript: string;
+  primary: VoiceIntentLite;
+  alternatives: VoiceIntentLite[];
+  confidence: number;
+  timestamp: number;
+};
+
+export type PendingRepeatBack = {
+  id: string;
+  transcript: string;
+  confidence: number;
+  timestamp: number;
 };
 
 type SidecarEventPayload = {
@@ -164,6 +206,35 @@ export type ProviderErrorFormatted = {
   summary: string;
   detail: string;
 };
+
+/**
+ * Mirror of `IMPACT_MAP` from `src/roles/authority.ts`. Used only during the
+ * REST rehydration path where the server response doesn't carry impact.
+ * If you change the daemon mapping, change this too.
+ */
+function deriveImpactFromCategory(category: string): ApprovalImpact {
+  switch (category) {
+    case "read_data":
+      return "read";
+    case "write_data":
+    case "send_message":
+    case "spawn_agent":
+    case "control_app":
+      return "write";
+    case "access_browser":
+    case "send_email":
+      return "external";
+    case "execute_command":
+    case "install_software":
+    case "make_payment":
+    case "modify_settings":
+    case "delete_data":
+    case "terminate_agent":
+      return "destructive";
+    default:
+      return "write";
+  }
+}
 
 /**
  * Canonical error codes emitted by the server. Keep in sync with
@@ -286,6 +357,22 @@ export function useWebSocket() {
   const [goalEvents, setGoalEvents] = useState<GoalEvent[]>([]);
   const [siteEvents, setSiteEvents] = useState<SiteEvent[]>([]);
   const [notices, setNotices] = useState<SystemNotice[]>([]);
+  const [approvals, setApprovals] = useState<PendingApproval[]>([]);
+  const [clarifiers, setClarifiers] = useState<PendingClarifier[]>([]);
+  const [repeatBacks, setRepeatBacks] = useState<PendingRepeatBack[]>([]);
+  const [thinking, setThinking] = useState(false);
+  const [roomNavRequest, setRoomNavRequest] = useState<{ key: string; ts: number } | null>(null);
+  const [windowControlRequest, setWindowControlRequest] = useState<{
+    action: "close" | "minimize" | "expand" | "restore" | "reorder";
+    target: string; // RoomKey or "most_recent"
+    ts: number;
+  } | null>(null);
+  const [roomActionRequest, setRoomActionRequest] = useState<{
+    room: string;
+    action: string;
+    args: Record<string, unknown>;
+    ts: number;
+  } | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const streamBufferRef = useRef<string>("");
   const streamIdRef = useRef<string | null>(null);
@@ -321,6 +408,43 @@ export function useWebSocket() {
       } catch (err) {
         console.warn("[WS] Failed to load history:", err);
       }
+
+      // Rehydrate any pending approval requests so a daemon restart (or a
+      // dashboard reload mid-approval) doesn't strand the user with no
+      // visible card. Server is authoritative.
+      // Phase 5B: REST now includes `intent` + `impact` directly (matches
+      // WS broadcast shape), so no more client-side derivation.
+      try {
+        const resp = await fetch("/api/authority/approvals?status=pending");
+        if (resp.ok) {
+          const rows = (await resp.json()) as Array<{
+            id: string;
+            agent_name: string;
+            tool_name: string;
+            action_category: string;
+            urgency: "urgent" | "normal";
+            reason: string;
+            created_at: number;
+            intent?: string;
+            impact?: ApprovalImpact;
+          }>;
+          const rehydrated: PendingApproval[] = rows.map((r) => ({
+            id: r.id,
+            shortId: r.id.slice(0, 8),
+            intent: r.intent ?? r.reason ?? r.tool_name,
+            category: r.action_category,
+            impact: r.impact ?? deriveImpactFromCategory(r.action_category),
+            agentName: r.agent_name,
+            toolName: r.tool_name,
+            urgency: r.urgency,
+            reason: r.reason,
+            timestamp: r.created_at,
+          }));
+          setApprovals(rehydrated);
+        }
+      } catch (err) {
+        console.warn("[WS] Failed to rehydrate approvals:", err);
+      }
     };
 
     ws.onclose = () => {
@@ -345,11 +469,32 @@ export function useWebSocket() {
 
         // Voice signal messages → route to voice hook
         if (msg.type === "tts_start") {
-          voiceCallbacksRef.current?.onTTSStart(msg.payload?.requestId);
+          voiceCallbacksRef.current?.onTTSStart(
+            msg.payload?.requestId,
+            Boolean(msg.payload?.containsWake),
+          );
+          setThinking(false); // speaking supersedes thinking
+          return;
+        }
+        if (msg.type === "tts_text") {
+          // Mid-turn signal that an upcoming sentence contains "Jarvis" —
+          // UI must suppress the wake recognizer so TTS playback doesn't
+          // self-trigger.
+          if (msg.payload?.containsWake) {
+            voiceCallbacksRef.current?.onTTSContainsWake?.();
+          }
           return;
         }
         if (msg.type === "tts_end") {
           voiceCallbacksRef.current?.onTTSEnd();
+          return;
+        }
+        if (msg.type === "thinking_start") {
+          setThinking(true);
+          return;
+        }
+        if (msg.type === "thinking_end") {
+          setThinking(false);
           return;
         }
 
@@ -570,6 +715,139 @@ export function useWebSocket() {
             timestamp: msg.timestamp,
           },
         ]);
+      } else if (payload.source === "approval_request") {
+        const p = payload as {
+          request?: {
+            id: string;
+            agent_name: string;
+            tool_name: string;
+            action_category: string;
+            urgency: "urgent" | "normal";
+            reason: string;
+          };
+          shortId?: string;
+          impact?: ApprovalImpact;
+          intent?: string;
+        };
+        if (p.request) {
+          const pending: PendingApproval = {
+            id: p.request.id,
+            shortId: p.shortId ?? p.request.id.slice(0, 8),
+            intent: p.intent ?? p.request.reason ?? p.request.tool_name,
+            category: p.request.action_category,
+            impact: p.impact ?? "write",
+            agentName: p.request.agent_name,
+            toolName: p.request.tool_name,
+            urgency: p.request.urgency,
+            reason: p.request.reason,
+            timestamp: msg.timestamp,
+          };
+          setApprovals((prev) =>
+            prev.some((a) => a.id === pending.id) ? prev : [...prev, pending],
+          );
+        }
+      } else if (payload.source === "approval_update") {
+        const requestId = (payload as { request?: { id: string } }).request?.id;
+        if (requestId) {
+          setApprovals((prev) => prev.filter((a) => a.id !== requestId));
+        }
+      } else if (payload.source === "clarifier_request") {
+        const p = payload as {
+          id?: string;
+          transcript?: string;
+          intent?: {
+            verb?: string;
+            impact?: string;
+            confidence?: number;
+            object?: { type?: string; query?: string } | null;
+            alternatives?: Array<{ label?: string; verb?: string; impact?: string }>;
+          };
+        };
+        if (!p.id || !p.transcript || !p.intent) return;
+        const primaryLabel = buildIntentLabel(p.intent.verb ?? "ask", p.intent.object ?? null, p.transcript);
+        const primary: VoiceIntentLite = {
+          label: primaryLabel,
+          verb: p.intent.verb ?? "ask",
+          impact: (p.intent.impact as ApprovalImpact) ?? "read",
+        };
+        const alternatives: VoiceIntentLite[] = (p.intent.alternatives ?? [])
+          .map((a) => ({
+            label: typeof a.label === "string" && a.label.length > 0 ? a.label : `${a.verb ?? "ask"}`,
+            verb: a.verb ?? "ask",
+            impact: (a.impact as ApprovalImpact) ?? "read",
+          }))
+          .slice(0, 2);
+        const pending: PendingClarifier = {
+          id: p.id,
+          transcript: p.transcript,
+          primary,
+          alternatives,
+          confidence: typeof p.intent.confidence === "number" ? p.intent.confidence : 0.7,
+          timestamp: msg.timestamp,
+        };
+        setClarifiers((prev) =>
+          prev.some((c) => c.id === pending.id) ? prev : [...prev, pending],
+        );
+      } else if (payload.source === "repeat_back_request") {
+        const p = payload as { id?: string; transcript?: string; confidence?: number };
+        if (!p.id || !p.transcript) return;
+        const pending: PendingRepeatBack = {
+          id: p.id,
+          transcript: p.transcript,
+          confidence: typeof p.confidence === "number" ? p.confidence : 0.4,
+          timestamp: msg.timestamp,
+        };
+        setRepeatBacks((prev) =>
+          prev.some((r) => r.id === pending.id) ? prev : [...prev, pending],
+        );
+      } else if (payload.source === "voice_confirmation_resolved") {
+        const id = (payload as { id?: string }).id;
+        if (id) {
+          setClarifiers((prev) => prev.filter((c) => c.id !== id));
+          setRepeatBacks((prev) => prev.filter((r) => r.id !== id));
+        }
+      } else if (payload.source === "navigate_room") {
+        // Daemon-driven Room navigation (voice "open workflows" etc.).
+        // Bumping `ts` on every emit guarantees React sees a new value
+        // even if the user navigates to the same Room twice in a row.
+        const key = (payload as { key?: string }).key;
+        if (typeof key === "string") {
+          setRoomNavRequest({ key, ts: msg.timestamp });
+        }
+      } else if (payload.source === "navigate_home") {
+        // Daemon-driven home/back navigation (voice "back to thread", etc.).
+        // Reuses the same channel as Room nav so AppShell only watches one
+        // signal — distinguished by key === "home".
+        setRoomNavRequest({ key: "home", ts: msg.timestamp });
+      } else if (payload.source === "room_action") {
+        // Phase 6.3.5 — Room control via voice. Daemon broadcasts a
+        // structured action; the UI's action bus dispatches to whichever
+        // Room is currently registered. `ts` bumps so the same action
+        // repeated produces a new effect.
+        const p = payload as { room?: string; action?: string; args?: unknown };
+        if (typeof p.room === "string" && typeof p.action === "string") {
+          setRoomActionRequest({
+            room: p.room,
+            action: p.action,
+            args:
+              p.args && typeof p.args === "object"
+                ? (p.args as Record<string, unknown>)
+                : {},
+            ts: msg.timestamp,
+          });
+        }
+      } else if (payload.source === "window_control") {
+        // Phase 6.1.5 follow-up: voice window-control ("close", "expand",
+        // "minimize" etc.) — daemon regex-matches and broadcasts here so
+        // the UI can drive RoomWindow chrome without an LLM round-trip.
+        const action = (payload as { action?: string }).action;
+        const target = (payload as { target?: string }).target;
+        if (
+          (action === "close" || action === "minimize" || action === "expand" || action === "restore" || action === "reorder") &&
+          typeof target === "string"
+        ) {
+          setWindowControlRequest({ action, target, ts: msg.timestamp });
+        }
       }
     } else if (msg.type === "error") {
       const rawMessage = msg.payload?.message;
@@ -624,7 +902,7 @@ export function useWebSocket() {
   }, [connect]);
 
   const sendMessage = useCallback(
-    (text: string, options?: { projectId?: string }) => {
+    (text: string, options?: { projectId?: string; currentRoom?: string }) => {
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
       const id = crypto.randomUUID();
@@ -645,12 +923,15 @@ export function useWebSocket() {
       // with the chat request that provoked it.
       pendingChatIdsRef.current.add(id);
 
-      // Send to server
+      // Send to server. `currentRoom` lets the daemon's intent classifier
+      // (run on text submissions for nav/room_action interception) bias
+      // toward in-room actions when the user is already inside a Room.
       const msg: WSMessage = {
         type: "chat",
         payload: {
           text,
           ...(options?.projectId ? { projectId: options.projectId } : {}),
+          ...(options?.currentRoom ? { currentRoom: options.currentRoom } : {}),
         },
         id,
         timestamp: Date.now(),
@@ -666,7 +947,46 @@ export function useWebSocket() {
 
   return {
     messages, isConnected, sendMessage, taskEvents, contentEvents, agentActivity, workflowEvents, goalEvents, siteEvents, notices, dismissNotice,
+    approvals,
+    clarifiers,
+    repeatBacks,
+    thinking,
+    roomNavRequest,
+    windowControlRequest,
+    roomActionRequest,
     wsRef,
     voiceCallbacksRef,
   };
+}
+
+/**
+ * Render a short imperative label for a voice intent. The classifier emits
+ * structured fields (verb + object); we synthesize a sentence good enough
+ * for the clarifier card heading. Falls back to the raw transcript when
+ * structure is missing.
+ */
+function buildIntentLabel(
+  verb: string,
+  object: { type?: string; query?: string } | null,
+  transcript: string,
+): string {
+  const obj = object?.query ?? object?.type ?? "";
+  const verbLabel: Record<string, string> = {
+    ask: "Answer about",
+    show: "Open",
+    run: "Run",
+    create: "Create",
+    update: "Update",
+    delete: "Delete",
+    grant: "Grant authority for",
+    revoke: "Revoke authority for",
+    pause: "Pause",
+    resume: "Resume",
+    unknown: "Handle",
+  };
+  const head = verbLabel[verb] ?? "Handle";
+  if (obj) return `${head} ${obj}`;
+  // No object — echo the user's words as the most informative thing we can say.
+  const trimmed = transcript.trim();
+  return trimmed.length > 0 ? `${head}: "${trimmed}"` : head;
 }

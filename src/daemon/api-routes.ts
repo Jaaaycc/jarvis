@@ -18,15 +18,19 @@ import type { AuditTrail, AuthorityDecisionType } from '../authority/audit.ts';
 import type { AuthorityLearner } from '../authority/learning.ts';
 import type { EmergencyController } from '../authority/emergency.ts';
 import type { DeferredExecutor } from '../authority/deferred-executor.ts';
+import { applyQuickOverride } from '../authority/quick-override.ts';
 import type { ActionCategory } from '../roles/authority.ts';
 
-import { findEntities, getEntity, searchEntitiesByName } from '../vault/entities.ts';
-import { findFacts } from '../vault/facts.ts';
-import { findRelationships, getEntityRelationships } from '../vault/relationships.ts';
+import { findEntities, getEntity, searchEntitiesByName, createEntity } from '../vault/entities.ts';
+import { findFacts, createFact } from '../vault/facts.ts';
+import { findRelationships, getEntityRelationships, createRelationship } from '../vault/relationships.ts';
+
+const VALID_ENTITY_TYPES = new Set(['person', 'project', 'tool', 'place', 'concept', 'event']);
 import { getDb } from '../vault/schema.ts';
 import { findCommitments, getUpcoming, createCommitment, getCommitment, updateCommitmentStatus, reorderCommitments } from '../vault/commitments.ts';
 import { getOrCreateConversation, getMessages, getRecentConversation } from '../vault/conversations.ts';
-import { getRecentObservations } from '../vault/observations.ts';
+import { getRecentObservations, summarizeObservation } from '../vault/observations.ts';
+import { listAgentActivity, countAgentActivity } from '../vault/agent-activity.ts';
 import { getPersonality } from '../personality/model.ts';
 import { clearUserProfile, getUserProfile, saveUserProfile } from '../vault/user-profile.ts';
 import {
@@ -113,6 +117,17 @@ import {
 } from '../cli/autostart.ts';
 
 export type ApiContext = {
+  /**
+   * Daemon process boot time (Date.now() at start). Surfaced via the
+   * onboarding-status endpoint so the dashboard can detect when setup
+   * was completed AFTER the daemon started — that's the case where
+   * the daemon is still in setup-mode and needs a restart for
+   * background services (heartbeat / commitments / awareness) to
+   * spin up. Until those services can construct in-process at setup
+   * completion, the dashboard renders a "Restart Jarvis" banner when
+   * `setup_completed_at > daemon_started_at`. (See also issue F2.)
+   */
+  daemonStartedAt: number;
   healthMonitor: HealthMonitor;
   agentService: AgentService;
   config: JarvisConfig;
@@ -242,6 +257,26 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         if (q) query.nameContains = q;
         return json(findEntities(query));
       },
+      // Phase 6.5 — write surface for the Memory Room. Routes through
+      // createEntity directly; the LLM-driven extractor pipeline keeps
+      // its own internal call site for auto-extraction, this is for
+      // explicit user-driven adds (UI button or voice "remember that").
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as {
+            name?: string;
+            type?: EntityType;
+            properties?: Record<string, unknown>;
+            source?: string;
+          };
+          if (!body.name || typeof body.name !== 'string') return error('name is required', 400);
+          if (!body.type || !VALID_ENTITY_TYPES.has(body.type)) {
+            return error(`type must be one of: ${Array.from(VALID_ENTITY_TYPES).join(', ')}`, 400);
+          }
+          const entity = createEntity(body.type, body.name, body.properties, body.source ?? 'dashboard');
+          return json(entity);
+        } catch (err) { return errorFromException(err); }
+      },
     },
 
     '/api/vault/entities/:id': {
@@ -277,6 +312,27 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         if (object) query.object = object;
         return json(findFacts(query));
       },
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as {
+            subject_id?: string;
+            predicate?: string;
+            object?: string;
+            confidence?: number;
+            source?: string;
+          };
+          if (!body.subject_id || !body.predicate || !body.object) {
+            return error('subject_id, predicate, and object are required', 400);
+          }
+          const subject = getEntity(body.subject_id);
+          if (!subject) return error(`Unknown subject_id: ${body.subject_id}`, 404);
+          const fact = createFact(body.subject_id, body.predicate, body.object, {
+            confidence: body.confidence,
+            source: body.source ?? 'dashboard',
+          });
+          return json(fact);
+        } catch (err) { return errorFromException(err); }
+      },
     },
 
     // --- Vault: Relationships ---
@@ -291,6 +347,25 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         if (toId) query.to_id = toId;
         if (type) query.type = type;
         return json(findRelationships(query));
+      },
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as {
+            from_id?: string;
+            to_id?: string;
+            type?: string;
+            properties?: Record<string, unknown>;
+          };
+          if (!body.from_id || !body.to_id || !body.type) {
+            return error('from_id, to_id, and type are required', 400);
+          }
+          const from = getEntity(body.from_id);
+          const to = getEntity(body.to_id);
+          if (!from) return error(`Unknown from_id: ${body.from_id}`, 404);
+          if (!to) return error(`Unknown to_id: ${body.to_id}`, 404);
+          const rel = createRelationship(body.from_id, body.to_id, body.type, body.properties);
+          return json(rel);
+        } catch (err) { return errorFromException(err); }
       },
     },
 
@@ -512,7 +587,13 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         const params = getSearchParams(req);
         const type = params.get('type') as ObservationType | undefined;
         const limit = parseInt(params.get('limit') ?? '50') || 50;
-        return json(getRecentObservations(type, limit));
+        const summarized = params.get('summarized') === 'true';
+        const obs = getRecentObservations(type, limit);
+        if (!summarized) return json(obs);
+        // Phase 5B: when ?summarized=true, project each row into the
+        // stable {title, summary, type, created_at} shape the dashboard
+        // can render uniformly across all observation types.
+        return json(obs.map((o) => ({ ...summarizeObservation(o), data: o.data })));
       },
     },
 
@@ -682,6 +763,26 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       },
     },
 
+    // Phase 6.3 — per-agent activity history. Persisted snapshot of
+    // sub-agent events so the Agents Room shows a meaningful timeline on
+    // dashboard load (not just whatever streamed since the WS opened).
+    '/api/agents/:id/activity': {
+      GET: (req: Request & { params: { id: string } }) => {
+        try {
+          const url = new URL(req.url);
+          const limitParam = parseInt(url.searchParams.get('limit') ?? '', 10);
+          const offsetParam = parseInt(url.searchParams.get('offset') ?? '', 10);
+          const limit = Number.isFinite(limitParam) ? limitParam : 50;
+          const offset = Number.isFinite(offsetParam) ? offsetParam : 0;
+          const events = listAgentActivity(req.params.id, { limit, offset });
+          const total = countAgentActivity(req.params.id);
+          return json({ events, total });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
     '/api/agents/tree': {
       GET: () => {
         const orchestrator = ctx.agentService.getOrchestrator();
@@ -756,6 +857,326 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       POST: () => {
         clearUserProfile();
         return json({ ok: true, message: 'User profile cleared.' });
+      },
+    },
+
+    // ── Onboarding ──────────────────────────────────────────────────
+    // Status + reset endpoints powering the v2 onboarding gate. See
+    // `docs/ONBOARDING_PLAN.md`. Reset is intentionally available on
+    // demand (not behind a build flag) so users can replay the tour
+    // after a Jarvis update or when swapping LLM providers.
+
+    '/api/onboarding/status': {
+      GET: async () => {
+        try {
+          const { loadConfig } = await import('../config/loader.ts');
+          const cfg = await loadConfig();
+          const o = cfg.onboarding;
+          // `getUserProfile` and `hasUserProfile` are already imported
+          // at the top of the file. Use `hasUserProfile()` so the
+          // check counts wizard answers AND Phase B interview facts —
+          // otherwise a user who completed the conversational
+          // interview (but never used the wizard) gets reported as
+          // "not yet onboarded" and the gate loops them back into
+          // the interview.
+          const profile = getUserProfile();
+          const profileCompleted =
+            !!o?.setup_skipped_profile || hasUserProfile(profile);
+          return json({
+            setup_completed: o?.setup_completed_at != null,
+            setup_completed_at: o?.setup_completed_at ?? null,
+            setup_skipped_profile: !!o?.setup_skipped_profile,
+            profile_completed: profileCompleted,
+            tutorial_completed: o?.tutorial_completed_at != null,
+            tutorial_completed_at: o?.tutorial_completed_at ?? null,
+            tutorial_dismissed: o?.tutorial_dismissed_at != null,
+            tutorial_progress_step: o?.tutorial_progress_step ?? null,
+            last_reset_at: o?.last_reset_at ?? null,
+            // Boot timestamp lets the dashboard detect when setup
+            // completed AFTER the daemon started (= restart needed
+            // before background services activate).
+            daemon_started_at: ctx.daemonStartedAt,
+          });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
+    '/api/onboarding/reset': {
+      POST: async (req: Request) => {
+        try {
+          const body = (await req.json().catch(() => ({}))) as {
+            scope?: 'all' | 'setup' | 'profile' | 'tutorial';
+          };
+          const scope = body?.scope ?? 'all';
+          if (!['all', 'setup', 'profile', 'tutorial'].includes(scope)) {
+            return error(`Invalid scope "${scope}".`, 400);
+          }
+
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const fresh = await loadConfig();
+          const o = fresh.onboarding ?? {
+            setup_completed_at: null,
+            tutorial_completed_at: null,
+          };
+
+          const cleared: string[] = [];
+          if (scope === 'all' || scope === 'setup') {
+            o.setup_completed_at = null;
+            cleared.push('setup');
+          }
+          if (scope === 'all' || scope === 'profile') {
+            o.setup_skipped_profile = false;
+            clearUserProfile();
+            cleared.push('profile');
+          }
+          if (scope === 'all' || scope === 'tutorial') {
+            o.tutorial_completed_at = null;
+            o.tutorial_dismissed_at = null;
+            o.tutorial_progress_step = undefined;
+            cleared.push('tutorial');
+          }
+          o.last_reset_at = Date.now();
+          fresh.onboarding = o;
+          await saveConfig(fresh);
+
+          // Mirror to in-memory config so the next /status read is
+          // immediately consistent (don't wait for daemon restart).
+          ctx.config.onboarding = o;
+
+          // localStorage keys the client should also clear after this
+          // call. Returned in the response so the UI handler doesn't
+          // have to know about cache layers it didn't write.
+          const clientCacheKeys = ['jarvis:notif-read', 'jarvis:palette-recent'];
+          if (scope === 'all') {
+            clientCacheKeys.push('jarvis:v2:workspaces-ui');
+            clientCacheKeys.push('jarvis:room-layout');
+          }
+
+          return json({
+            ok: true,
+            scope,
+            cleared,
+            client_cache_keys: clientCacheKeys,
+            message: `Onboarding reset (${cleared.join(', ')}).`,
+          });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
+    /**
+     * Phase B — user skipped the conversational profile interview.
+     * Sets `setup_skipped_profile: true` so the gate stops re-rendering
+     * Phase B. Profile remains empty; user can fill it later via the
+     * Settings → Profile wizard or by saying "redo the profile interview".
+     */
+    '/api/onboarding/profile/skip': {
+      POST: async () => {
+        try {
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const fresh = await loadConfig();
+          fresh.onboarding = {
+            setup_completed_at: fresh.onboarding?.setup_completed_at ?? null,
+            tutorial_completed_at: fresh.onboarding?.tutorial_completed_at ?? null,
+            ...fresh.onboarding,
+            setup_skipped_profile: true,
+          };
+          await saveConfig(fresh);
+          ctx.config.onboarding = fresh.onboarding;
+          return json({ ok: true, setup_skipped_profile: true });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
+    // ── Phase C — tutorial completion endpoints ─────────────────────
+    // Three small endpoints powering the spotlight walkthrough's
+    // persistence: complete (user finished), dismiss (user skipped),
+    // progress (resume-from-step support). All three write through
+    // the same loadConfig → mutate → saveConfig pattern as the rest
+    // of the onboarding routes; the existing reset endpoint with
+    // `scope: "tutorial"` already clears all three fields.
+
+    '/api/onboarding/tutorial/complete': {
+      POST: async () => {
+        try {
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const fresh = await loadConfig();
+          const now = Date.now();
+          fresh.onboarding = {
+            setup_completed_at: fresh.onboarding?.setup_completed_at ?? null,
+            ...fresh.onboarding,
+            tutorial_completed_at: now,
+            tutorial_progress_step: undefined,
+          };
+          await saveConfig(fresh);
+          ctx.config.onboarding = fresh.onboarding;
+          return json({ ok: true, tutorial_completed_at: now });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
+    '/api/onboarding/tutorial/dismiss': {
+      POST: async () => {
+        try {
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const fresh = await loadConfig();
+          const now = Date.now();
+          fresh.onboarding = {
+            setup_completed_at: fresh.onboarding?.setup_completed_at ?? null,
+            tutorial_completed_at: fresh.onboarding?.tutorial_completed_at ?? null,
+            ...fresh.onboarding,
+            tutorial_dismissed_at: now,
+          };
+          await saveConfig(fresh);
+          ctx.config.onboarding = fresh.onboarding;
+          return json({ ok: true, tutorial_dismissed_at: now });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
+    '/api/onboarding/tutorial/progress': {
+      POST: async (req: Request) => {
+        try {
+          const body = (await req.json().catch(() => ({}))) as { stepId?: string };
+          const stepId = typeof body.stepId === 'string' ? body.stepId.trim() : '';
+          if (!stepId) return error('Missing stepId.', 400);
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const fresh = await loadConfig();
+          fresh.onboarding = {
+            setup_completed_at: fresh.onboarding?.setup_completed_at ?? null,
+            tutorial_completed_at: fresh.onboarding?.tutorial_completed_at ?? null,
+            ...fresh.onboarding,
+            tutorial_progress_step: stepId,
+          };
+          await saveConfig(fresh);
+          ctx.config.onboarding = fresh.onboarding;
+          return json({ ok: true, tutorial_progress_step: stepId });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
+    /**
+     * Phase C — tutorial narration TTS broadcast. Speaks `text`
+     * through the existing TTS provider so the AppShell's `useVoice`
+     * picks it up via the regular `tts_start` + binary chunks path.
+     * The orb pulses speaking; the tutorial bubble mirrors it.
+     * Synchronous-ish: returns when synthesis completes (so the UI
+     * can advance to listening for the next "next" command).
+     */
+    '/api/onboarding/tutorial/speak': {
+      POST: async (req: Request) => {
+        try {
+          const body = (await req.json().catch(() => ({}))) as { text?: string };
+          const text = typeof body.text === 'string' ? body.text.trim() : '';
+          if (!text) return error('Missing text.', 400);
+          if (!ctx.wsService) return error('WS service unavailable.', 503);
+          // Reuse the proactive TTS broadcast — it already wraps with
+          // tts_start (with containsWake flag), streams binary chunks,
+          // and emits tts_end. No new transport.
+          await ctx.wsService.broadcastProactiveVoice(text);
+          return json({ ok: true });
+        } catch (err) {
+          return errorFromException(err);
+        }
+      },
+    },
+
+    /**
+     * Atomic Phase A setup endpoint. Saves LLM + TTS config + flips
+     * the `onboarding.setup_completed_at` flag in one shot, then hot-
+     * reloads the LLM providers and TTS provider so the next chat
+     * message goes through real services without a daemon restart.
+     *
+     * Body shape:
+     *   {
+     *     llm: {
+     *       primary: "anthropic" | "openai" | ... ,
+     *       <provider>: { api_key?: string, model?: string, base_url?: string }
+     *     },
+     *     tts: {
+     *       enabled: boolean,
+     *       provider?: "edge" | "elevenlabs" | "sarvam",
+     *       voice?: string,
+     *       rate?: string,
+     *       elevenlabs?: { api_key?: string, voice_id?: string, model?: string },
+     *     }
+     *   }
+     *
+     * Either field is optional; missing means "use current/default".
+     * The TTS block is required to be present (even if just `{enabled:false}`)
+     * so the user explicitly chose during the setup screen.
+     */
+    '/api/onboarding/setup': {
+      POST: async (req: Request) => {
+        try {
+          const body = (await req.json()) as {
+            llm?: Record<string, unknown>;
+            tts?: Record<string, unknown>;
+          };
+
+          // 1. LLM settings — same path as /api/config/llm POST.
+          if (body.llm && Object.keys(body.llm).length > 0) {
+            const { saveLLMSettings, hotReloadLLMProviders } = await import('./llm-settings.ts');
+            saveLLMSettings(ctx.config, body.llm as any);
+            hotReloadLLMProviders(ctx.config, ctx.agentService.getLLMManager());
+          }
+
+          // 2. TTS settings — same path as /api/config/tts POST. Inline
+          //    the relevant write since the TTS endpoint is large; we
+          //    don't need provider hot-swap UI feedback here.
+          if (body.tts) {
+            const { loadConfig: lc, saveConfig: sc } = await import('../config/loader.ts');
+            const fresh = await lc();
+            fresh.tts = { ...fresh.tts, ...(body.tts as any) };
+            await sc(fresh);
+            ctx.config.tts = fresh.tts;
+            // Hot-reload TTS provider when possible so the post-setup
+            // "Welcome to Jarvis" reply is spoken immediately.
+            try {
+              if (ctx.config.tts && ctx.wsService) {
+                const { createTTSProvider } = await import('../comms/voice.ts');
+                const provider = await createTTSProvider(ctx.config.tts);
+                if (provider) ctx.wsService.setTTSProvider(provider);
+              }
+            } catch (err) {
+              console.warn('[Onboarding] TTS hot-reload skipped:', err);
+            }
+          }
+
+          // 3. Flip the setup-completed flag.
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const fresh = await loadConfig();
+          const now = Date.now();
+          fresh.onboarding = {
+            setup_completed_at: now,
+            tutorial_completed_at: fresh.onboarding?.tutorial_completed_at ?? null,
+            setup_skipped_profile: fresh.onboarding?.setup_skipped_profile,
+            tutorial_dismissed_at: fresh.onboarding?.tutorial_dismissed_at,
+            tutorial_progress_step: fresh.onboarding?.tutorial_progress_step,
+            last_reset_at: fresh.onboarding?.last_reset_at,
+          };
+          await saveConfig(fresh);
+          ctx.config.onboarding = fresh.onboarding;
+
+          return json({
+            ok: true,
+            setup_completed_at: now,
+            message: 'Setup complete. Jarvis is ready.',
+          });
+        } catch (err) {
+          return errorFromException(err);
+        }
       },
     },
 
@@ -1489,15 +1910,34 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         if (!ctx.approvalManager) return json([]);
         const params = getSearchParams(req);
         const status = params.get('status');
-        if (status === 'pending') {
-          return json(ctx.approvalManager.getPending());
-        }
-        return json(ctx.approvalManager.getHistory({
-          limit: parseInt(params.get('limit') ?? '50') || 50,
-          action: (params.get('action') as ActionCategory) || undefined,
-          agentId: params.get('agent_id') || undefined,
-          status: (params.get('status') as any) || undefined,
+        const rows =
+          status === 'pending'
+            ? ctx.approvalManager.getPending()
+            : ctx.approvalManager.getHistory({
+                limit: parseInt(params.get('limit') ?? '50') || 50,
+                action: (params.get('action') as ActionCategory) || undefined,
+                agentId: params.get('agent_id') || undefined,
+                status: (params.get('status') as any) || undefined,
+              });
+
+        // Phase 5B audit fix: enrich the REST response with the same
+        // `intent` + `impact` fields the WS broadcasts already carry, so
+        // dashboard rehydration on reconnect doesn't have to derive them
+        // client-side from `tool_name` + `action_category`.
+        const { impactFromCategory } = require('../roles/authority.ts');
+        const wsService = ctx.wsService as
+          | { computeApprovalIntent?: (r: typeof rows[number]) => string }
+          | undefined;
+
+        const enriched = rows.map((r) => ({
+          ...r,
+          impact: impactFromCategory(r.action_category as ActionCategory),
+          intent:
+            wsService?.computeApprovalIntent?.(r) ??
+            (r.reason && r.reason.trim() ? r.reason : r.tool_name),
         }));
+
+        return json(enriched);
       },
     },
 
@@ -1510,10 +1950,16 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         const approved = ctx.approvalManager.approve(requestId, 'dashboard');
         if (!approved) return error('Request not found or already decided', 404);
 
-        // Execute the approved tool
-        const result = await ctx.deferredExecutor.executeApproved(requestId);
+        // Intent-declaration approvals have no deferred tool to execute —
+        // the originating `request_approval` tool call is blocked waiting for
+        // the DB status to flip (via waitForResolution polling). Skipping
+        // executeApproved avoids a recursive call into the tool registry.
+        let result = '';
+        if (approved.tool_name !== 'request_approval') {
+          result = await ctx.deferredExecutor.executeApproved(requestId);
+        }
 
-        // Broadcast the update
+        // Broadcast the update (removes the card from the dashboard thread)
         const updated = ctx.approvalManager.getRequest(requestId);
         if (updated) ctx.wsService?.broadcastApprovalUpdate(updated);
 
@@ -1537,6 +1983,377 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         ctx.wsService?.broadcastApprovalUpdate(denied);
 
         return json({ ok: true });
+      },
+    },
+
+    /**
+     * Palette recent picks — daemon-side LRU surviving reload + cross-device.
+     * The UI also keeps a localStorage cache as an offline fallback.
+     */
+    '/api/palette/recent': {
+      GET: (req: Request) => {
+        const { listRecentObjects } = require('../vault/recent-objects.ts');
+        const params = getSearchParams(req);
+        const limit = Math.min(parseInt(params.get('limit') ?? '5') || 5, 50);
+        const rows = listRecentObjects(limit) as Array<{
+          object_type: string;
+          object_id: string;
+          title: string;
+          summary: string | null;
+          meta: string | null;
+          picked_at: number;
+        }>;
+        return json({
+          recent: rows.map((r) => ({
+            type: r.object_type,
+            id: r.object_id,
+            ref: r.object_id,
+            title: r.title,
+            summary: r.summary ?? undefined,
+            meta: r.meta ?? undefined,
+            pickedAt: r.picked_at,
+          })),
+        });
+      },
+      POST: async (req: Request) => {
+        try {
+          const body = (await req.json()) as {
+            type?: string;
+            id?: string;
+            title?: string;
+            summary?: string;
+            meta?: string;
+          };
+          if (!body.type || !body.id || !body.title) {
+            return error('type, id, and title are required', 400);
+          }
+          const { recordRecentObject } = require('../vault/recent-objects.ts');
+          recordRecentObject({
+            object_type: body.type,
+            object_id: body.id,
+            title: body.title,
+            summary: body.summary,
+            meta: body.meta,
+          });
+          return json({ ok: true });
+        } catch (err) {
+          return error(err instanceof Error ? err.message : 'failed', 500);
+        }
+      },
+    },
+
+    /**
+     * Tool registry exposure for the ⌘K palette and the Phase 6 Tools Room.
+     * Returns every registered tool with its category, impact classification,
+     * and parameter list. Impact is derived via the same `tool-action-map` +
+     * `impactFromCategory` chain the orchestrator uses at gate time, so the
+     * Room shows exactly the impact the user would actually face on call.
+     */
+    '/api/tools': {
+      GET: () => {
+        const orchestrator = ctx.agentService.getOrchestrator();
+        const registry = orchestrator.getToolRegistry();
+        if (!registry) return json([]);
+        const { getActionForTool } = require('../authority/tool-action-map.ts');
+        const { impactFromCategory } = require('../roles/authority.ts');
+        const tools = registry.list().map((t) => {
+          const actionCategory = getActionForTool(t.name, t.category);
+          const impact = impactFromCategory(actionCategory);
+          return {
+            name: t.name,
+            category: t.category,
+            actionCategory,
+            impact,
+            description: t.description,
+            parameters: Object.entries(t.parameters).map(([k, v]) => ({
+              name: k,
+              type: v.type,
+              description: v.description,
+              required: v.required,
+            })),
+          };
+        });
+        return json(tools);
+      },
+    },
+
+    /**
+     * Unified palette search aggregator. Merges all six object types into a
+     * single `PaletteResult[]` shape that maps directly to `<InlineCard>`
+     * props on the UI side. Each type is bounded so a single overflowing
+     * type can't crowd out the others.
+     *
+     * Empty `q` returns a small "recent / popular" slice per type so the
+     * palette has something useful to show on first open.
+     *
+     * Substring matching is case-insensitive. Client-side fuzzy ranking
+     * (`fuse.js`) refines order on top of these results.
+     */
+    '/api/palette/search': {
+      GET: (req: Request) => {
+        const params = getSearchParams(req);
+        const q = (params.get('q') ?? '').trim();
+        const perType = Math.min(parseInt(params.get('per_type') ?? '6') || 6, 20);
+        const ql = q.toLowerCase();
+        const matches = (s: string | undefined | null): boolean =>
+          !ql || (typeof s === 'string' && s.toLowerCase().includes(ql));
+
+        type PaletteResult = {
+          type: 'workflow' | 'memory' | 'tool' | 'agent' | 'authority' | 'log';
+          id: string;
+          ref: string;
+          title: string;
+          summary?: string;
+          meta?: string;
+          status?: { label: string; tone: 'ok' | 'warn' | 'neutral' | 'accent' };
+        };
+
+        const results: PaletteResult[] = [];
+
+        // 1. Workflows
+        try {
+          const { findWorkflows } = require('../vault/workflows.ts');
+          const wfs = findWorkflows({ limit: 100 }) as Array<{
+            id: string;
+            name: string;
+            description?: string;
+            enabled?: boolean;
+            tags?: string[];
+            current_version?: number;
+            execution_count?: number;
+            last_executed_at?: number | null;
+          }>;
+          let added = 0;
+          for (const w of wfs) {
+            if (added >= perType) break;
+            if (!matches(w.name) && !matches(w.description)) continue;
+            // Phase 5B: enrich the meta line with version + run count when
+            // available so the palette row tells the user what they're picking
+            // beyond just tags.
+            const metaParts: string[] = [];
+            if (typeof w.current_version === 'number') metaParts.push(`v${w.current_version}`);
+            if (typeof w.execution_count === 'number') {
+              metaParts.push(`${w.execution_count} ${w.execution_count === 1 ? 'run' : 'runs'}`);
+            }
+            if (w.tags && w.tags.length > 0) metaParts.push(w.tags.join(' · '));
+            results.push({
+              type: 'workflow',
+              id: w.id,
+              ref: w.id,
+              title: w.name,
+              summary: w.description,
+              meta: metaParts.length > 0 ? metaParts.join(' · ') : undefined,
+              status: w.enabled
+                ? { label: 'Enabled', tone: 'ok' }
+                : { label: 'Disabled', tone: 'neutral' },
+            });
+            added++;
+          }
+        } catch (err) {
+          console.warn('[palette] workflow search failed:', err);
+        }
+
+        // 2. Memory entities (vault)
+        try {
+          const entityResults = ql
+            ? searchEntitiesByName(q).slice(0, perType * 2)
+            : findEntities({}).slice(0, perType);
+          let added = 0;
+          for (const e of entityResults) {
+            if (added >= perType) break;
+            const props = (e.properties ?? {}) as Record<string, unknown>;
+            const desc = typeof props.description === 'string' ? props.description : undefined;
+            results.push({
+              type: 'memory',
+              id: e.id,
+              ref: e.id,
+              title: e.name,
+              summary: desc,
+              meta: e.type,
+            });
+            added++;
+          }
+        } catch (err) {
+          console.warn('[palette] memory search failed:', err);
+        }
+
+        // 3. Tools (from the orchestrator registry)
+        try {
+          const orchestrator = ctx.agentService.getOrchestrator();
+          const registry = orchestrator.getToolRegistry();
+          if (registry) {
+            let added = 0;
+            for (const t of registry.list()) {
+              if (added >= perType) break;
+              if (!matches(t.name) && !matches(t.description)) continue;
+              results.push({
+                type: 'tool',
+                id: t.name,
+                ref: t.name,
+                title: t.name,
+                summary: t.description,
+                meta: t.category,
+              });
+              added++;
+            }
+          }
+        } catch (err) {
+          console.warn('[palette] tool search failed:', err);
+        }
+
+        // 4. Agents
+        try {
+          const agents = buildAgentSnapshots(ctx).agents as Array<{
+            id: string;
+            role?: { name?: string; description?: string };
+            status?: string;
+            isBusy?: boolean;
+          }>;
+          let added = 0;
+          for (const a of agents) {
+            if (added >= perType) break;
+            const name = a.role?.name ?? a.id;
+            const desc = a.role?.description;
+            if (!matches(name) && !matches(desc)) continue;
+            results.push({
+              type: 'agent',
+              id: a.id,
+              ref: a.id,
+              title: name,
+              summary: desc,
+              meta: a.status,
+              status: a.isBusy
+                ? { label: 'Busy', tone: 'warn' }
+                : { label: 'Idle', tone: 'neutral' },
+            });
+            added++;
+          }
+        } catch (err) {
+          console.warn('[palette] agent search failed:', err);
+        }
+
+        // 5. Authority — pending approvals
+        try {
+          const mgr = ctx.approvalManager;
+          if (mgr) {
+            const pending = mgr.getPending();
+            let added = 0;
+            for (const a of pending) {
+              if (added >= perType) break;
+              if (!matches(a.reason) && !matches(a.tool_name) && !matches(a.action_category)) continue;
+              results.push({
+                type: 'authority',
+                id: a.id,
+                ref: a.id,
+                title: a.reason || a.tool_name,
+                summary: `${a.tool_name} · ${a.action_category}`,
+                meta: a.urgency,
+                status: { label: 'Pending', tone: 'warn' },
+              });
+              added++;
+            }
+          }
+        } catch (err) {
+          console.warn('[palette] authority search failed:', err);
+        }
+
+        // 6. Logs (recent observations) — normalized via summarizeObservation
+        try {
+          const obs = getRecentObservations(undefined, perType * 4);
+          let added = 0;
+          for (const o of obs) {
+            if (added >= perType) break;
+            const sum = summarizeObservation(o);
+            if (!matches(sum.title) && !matches(sum.summary)) continue;
+            results.push({
+              type: 'log',
+              id: o.id,
+              ref: o.id,
+              title: sum.title,
+              summary: sum.summary || undefined,
+              meta: new Date(o.created_at).toLocaleTimeString(),
+            });
+            added++;
+          }
+        } catch (err) {
+          console.warn('[palette] log search failed:', err);
+        }
+
+        return json({ q, results });
+      },
+    },
+
+    /**
+     * Voice clarifier / repeat-back resolution.
+     * The daemon holds a pending utterance when the classifier confidence is
+     * <0.85; the dashboard renders a clarifier or repeat-back card; this
+     * endpoint resolves it. `confirm` forwards the held transcript to the
+     * chat agent; `cancel` drops the request silently (the user-voice
+     * ThreadItem stays in the thread, no assistant reply follows).
+     */
+    '/api/voice/clarifier/:id/confirm': {
+      POST: async (req: Request & { params: { id: string } }) => {
+        if (!ctx.wsService) return error('WS service not configured', 500);
+        const result = await ctx.wsService.resolveVoiceConfirmation(req.params.id, 'confirm');
+        if (!result.ok) return error(result.reason ?? 'resolve failed', 404);
+        return json({ ok: true });
+      },
+    },
+    '/api/voice/clarifier/:id/cancel': {
+      POST: async (req: Request & { params: { id: string } }) => {
+        if (!ctx.wsService) return error('WS service not configured', 500);
+        const result = await ctx.wsService.resolveVoiceConfirmation(req.params.id, 'cancel');
+        if (!result.ok) return error(result.reason ?? 'resolve failed', 404);
+        return json({ ok: true });
+      },
+    },
+    '/api/voice/repeat-back/:id/confirm': {
+      POST: async (req: Request & { params: { id: string } }) => {
+        if (!ctx.wsService) return error('WS service not configured', 500);
+        const result = await ctx.wsService.resolveVoiceConfirmation(req.params.id, 'confirm');
+        if (!result.ok) return error(result.reason ?? 'resolve failed', 404);
+        return json({ ok: true });
+      },
+    },
+    '/api/voice/repeat-back/:id/cancel': {
+      POST: async (req: Request & { params: { id: string } }) => {
+        if (!ctx.wsService) return error('WS service not configured', 500);
+        const result = await ctx.wsService.resolveVoiceConfirmation(req.params.id, 'cancel');
+        if (!result.ok) return error(result.reason ?? 'resolve failed', 404);
+        return json({ ok: true });
+      },
+    },
+
+    /**
+     * LLM-quality "Try saying" suggestions for the voice rail. Body:
+     * `{ recentTurns: [{ role: 'user'|'assistant', text: string }, ...] }`.
+     * Returns `{ suggestions: string[] }` (3–5 items, never destructive).
+     * Empty array on cold-start or any LLM failure — the client falls back
+     * to its heuristic in that case.
+     */
+    '/api/voice/suggestions': {
+      POST: async (req: Request) => {
+        try {
+          const body = (await req.json()) as { recentTurns?: unknown };
+          const llm = ctx.agentService.getLLMManager();
+          const turns = Array.isArray(body.recentTurns)
+            ? body.recentTurns
+                .filter(
+                  (t): t is { role: 'user' | 'assistant'; text: string } =>
+                    !!t && typeof t === 'object'
+                    && (((t as { role?: unknown }).role === 'user') || ((t as { role?: unknown }).role === 'assistant'))
+                    && typeof (t as { text?: unknown }).text === 'string',
+                )
+                .slice(-5)
+            : [];
+
+          const { generateVoiceSuggestions } = await import('../agents/voice-suggestions.ts');
+          const suggestions = await generateVoiceSuggestions(turns, llm);
+          return json({ suggestions });
+        } catch (err) {
+          console.warn('[api] voice suggestions error:', err);
+          return json({ suggestions: [] });
+        }
       },
     },
 
@@ -1632,6 +2449,66 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           return json({ ok: true, config: currentConfig });
         } catch (err) {
           return error('Invalid request body');
+        }
+      },
+    },
+
+    /**
+     * Phase 6.6 — voice-friendly grant/revoke. Adds (or updates) a single
+     * per-action override to the authority config without exposing the
+     * full schema. Used by the Authority Room voice actions
+     * "grant_access" and "revoke_access" so the user can say
+     * "grant Jarvis email access" and have it persist.
+     *
+     * Body: { action: ActionCategory, allow: boolean, role_id?: string }
+     * Returns: { ok: true, config: AuthorityConfig }
+     *
+     * Idempotent: if a global override for the action already exists,
+     * its `allowed` flag is updated. Otherwise a new entry is appended.
+     * Role-scoped overrides (when `role_id` is provided) are matched by
+     * (action, role_id) tuple.
+     */
+    '/api/authority/config/quick-override': {
+      POST: async (req: Request) => {
+        if (!ctx.authorityEngine) return error('Authority engine not configured', 500);
+        try {
+          const body = await req.json() as { action?: ActionCategory; allow?: boolean; role_id?: string };
+          if (!body.action) return error('Missing "action" field', 400);
+          if (typeof body.allow !== 'boolean') return error('Missing "allow" boolean', 400);
+
+          const validActions: ReadonlyArray<ActionCategory> = [
+            'read_data', 'write_data', 'delete_data',
+            'send_message', 'send_email',
+            'execute_command', 'install_software',
+            'make_payment', 'modify_settings',
+            'spawn_agent', 'terminate_agent',
+            'access_browser', 'control_app',
+          ];
+          if (!validActions.includes(body.action)) {
+            return error(`Invalid action: ${body.action}`, 400);
+          }
+
+          // Single source of truth for the merge logic - shared with
+          // the unit test in quick-override.test.ts so they can't drift.
+          const currentConfig = applyQuickOverride(ctx.authorityEngine.getConfig(), {
+            action: body.action,
+            allow: body.allow,
+            role_id: body.role_id,
+          });
+          ctx.authorityEngine.updateConfig(currentConfig);
+
+          // Persist to config.yaml — same path as the full POST.
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const freshConfig = await loadConfig();
+          freshConfig.authority = {
+            ...freshConfig.authority,
+            overrides: currentConfig.overrides,
+          };
+          await saveConfig(freshConfig);
+
+          return json({ ok: true, config: currentConfig });
+        } catch (err) {
+          return error(`quick-override failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       },
     },
@@ -2111,6 +2988,51 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           );
           return json(result);
         } catch (err) { return error(`${err}`); }
+      },
+    },
+
+    /**
+     * Phase 6.4 — single-shot "create a workflow from this NL prompt".
+     * Used by the Workflows Room voice action create_from_nl. Differs
+     * from /nl-chat (which is conversational, chat-tab inside the editor)
+     * by going through `parseDescription()` — purpose-built for "build a
+     * full definition from this prompt", which writes nodes + edges in
+     * one round-trip instead of biasing the LLM toward Q&A.
+     *
+     * Body: { name: string, description?: string, prompt: string }
+     * Returns: { workflow: Workflow, version: WorkflowVersion }
+     */
+    '/api/workflows/nl-create': {
+      POST: async (req: Request) => {
+        if (!ctx.nlBuilder) return error('NL builder not available', 503);
+        try {
+          const body = await req.json() as {
+            name?: string;
+            description?: string;
+            prompt?: string;
+          };
+          const prompt = (body.prompt ?? '').trim();
+          if (!prompt) return error('prompt is required', 400);
+          const name = (body.name ?? '').trim() || 'New workflow';
+
+          // 1. Parse the NL into a full definition.
+          const definition = await ctx.nlBuilder.parseDescription(prompt);
+
+          // 2. Create the workflow shell + persist the definition as v1.
+          const wfModule = await import('../vault/workflows.ts');
+          const workflow = wfModule.createWorkflow(name, {
+            description: body.description ?? prompt,
+          });
+          const version = wfModule.createVersion(
+            workflow.id,
+            definition,
+            'Created from NL prompt',
+          );
+
+          return json({ workflow, version });
+        } catch (err) {
+          return error(`NL create failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
       },
     },
 

@@ -149,9 +149,59 @@ export function shouldSpeechWakeBeRunning(inputs: {
   const { isMicAvailable, wakeWordEnabled, voiceState, wakeEngine, speechRecognitionAvailable, speechWakeFatal } = inputs;
   if (speechWakeFatal) return false;
   if (!isMicAvailable || !wakeWordEnabled || !speechRecognitionAvailable) return false;
-  if (voiceState !== "idle" && voiceState !== "speaking") return false;
+  // Run in every state except active recording (which owns the mic for the
+  // live transcript recognizer). Includes processing/wake_detected/speaking
+  // so "Jarvis" can interrupt mid-thought, not just kick off from idle.
+  if (voiceState === "recording" || voiceState === "error") return false;
   if (wakeEngine === "openwakeword") return false;
   return true; // "webspeech" or "auto" with the API available
+}
+
+/**
+ * Pure decision: are we still inside the trailing-tail cooldown after a
+ * containsWake speaking turn exited? Used to suppress wake-recognizer
+ * restarts during the window in which trailing speaker audio could echo
+ * the wake word back into the mic.
+ *
+ * Boundary: returns `false` exactly when `now - exitedAt === cooldownMs`
+ * (strictly less than is "still inside"). Exported for unit testing.
+ */
+export function isWithinSpeakingTailCooldown(now: number, exitedAt: number, cooldownMs: number): boolean {
+  return now - exitedAt < cooldownMs;
+}
+
+/**
+ * Pure plan for what `handleTTSContainsWake` should do when invoked.
+ *
+ * The mid-turn `containsWake` flip is one-way (false → true only) because
+ * earlier audio carrying the wake word may still be in the speaker buffer
+ * when a later sentence arrives. Calling this with `currentFlag === true`
+ * is a no-op.
+ *
+ * Critically: the very same call that flips the flag must also stamp the
+ * trailing-tail cooldown. The "exit-stamp" effect inside `useVoice` only
+ * registers a cleanup function when its predicate is true at setup time —
+ * a flag flip via ref does not re-run the effect, so without this
+ * imperative stamp, the cooldown would silently not fire on turn end.
+ *
+ * Exported for unit testing; this is the regression boundary for the bug
+ * where a containsWake flip during a `speaking` turn left the cooldown
+ * un-stamped and trailing TTS audio re-triggered wake.
+ */
+export interface ContainsWakeFlipPlan {
+  /** Whether to perform the flip (false → true). */
+  shouldFlip: boolean;
+  /** Whether to stamp `speakingExitedAtRef.current = now()` immediately. */
+  shouldStampCooldown: boolean;
+  /** Whether to imperatively stop both wake recognizers. */
+  shouldStopRecognizers: boolean;
+}
+
+export function planContainsWakeFlip(currentFlag: boolean): ContainsWakeFlipPlan {
+  if (currentFlag) {
+    return { shouldFlip: false, shouldStampCooldown: false, shouldStopRecognizers: false };
+  }
+  return { shouldFlip: true, shouldStampCooldown: true, shouldStopRecognizers: true };
 }
 
 export type UseVoiceOptions = {
@@ -159,6 +209,22 @@ export type UseVoiceOptions = {
   wakeWordEnabled?: boolean;
   /** Default "openwakeword" (local). "webspeech" uses Chromium's cloud STT. */
   wakeEngine?: WakeEngineChoice;
+  /**
+   * Phase 6.7.C — Optional getter for the current Room key (or null when
+   * on the home thread). Included in every voice_start/voice_text payload
+   * so the daemon's classifier can disambiguate utterances like "show me
+   * active tasks" — chat answer when on home, room_action filter when in
+   * the tasks Room. Returns the literal string "home" for the thread view.
+   */
+  getCurrentRoom?: () => string | null;
+  /**
+   * Trailing cooldown (ms) applied after a `containsWake` speaking turn
+   * exits, before the wake recognizer is allowed to re-arm. Prevents
+   * trailing TTS speaker audio from self-triggering. Hardware echo on
+   * some headsets needs a longer tail; raise this if you see false
+   * wakes immediately after a reply finishes. Default 700.
+   */
+  speakingTailCooldownMs?: number;
 };
 
 export type UseVoiceReturn = {
@@ -172,18 +238,39 @@ export type UseVoiceReturn = {
   activeWakeEngine: ActiveWakeEngine;
   // Called by useWebSocket for TTS events
   handleTTSBinary: (data: ArrayBuffer) => void;
-  handleTTSStart: (requestId: string) => void;
+  handleTTSStart: (requestId: string, containsWake?: boolean) => void;
+  /** Mid-turn flip: a later sentence in the same TTS turn contains "Jarvis". */
+  handleTTSContainsWake: () => void;
   handleTTSEnd: () => void;
   handleError: (message?: string) => void;
+  // v2 additions (Phase 4A)
+  /** Mute the mic. While muted, wake-word is paused and `startRecording` is a no-op. */
+  muted: boolean;
+  setMuted: (next: boolean) => void;
+  /** Mic input level 0..1, RMS-derived from the analyser. 0 when not recording. */
+  micLevel: number;
+  /** Live interim STT text shown under the orb during recording. Empty when not listening. */
+  partialTranscript: string;
+  /** Snap state to idle. For non-streaming responses (e.g. Room nav) where no tts_start arrives. */
+  forceIdle: () => void;
 };
 
-export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwakeword" }: UseVoiceOptions): UseVoiceReturn {
+export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwakeword", getCurrentRoom, speakingTailCooldownMs = 700 }: UseVoiceOptions): UseVoiceReturn {
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
   const [isMicAvailable, setIsMicAvailable] = useState(false);
   const [isWakeWordReady, setIsWakeWordReady] = useState(false);
   const [ttsAudioPlaying, setTtsAudioPlaying] = useState(false);
   const [activeWakeEngine, setActiveWakeEngine] = useState<ActiveWakeEngine>("none");
   const [speechWakeFatal, setSpeechWakeFatal] = useState(false);
+  const [muted, setMutedState] = useState(false);
+  const [micLevel, setMicLevel] = useState(0);
+  const [partialTranscript, setPartialTranscript] = useState("");
+  const mutedRef = useRef(false);
+  const transcriptRecognizerRef = useRef<any>(null);
+  // Final transcript captured from the browser SpeechRecognition during the
+  // current recording. When present, we prefer this over uploading WAV for
+  // daemon Whisper because it's typically more accurate for short utterances.
+  const finalBrowserTranscriptRef = useRef("");
 
   const recordingContextRef = useRef<AudioContext | null>(null);
   const recordingSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -211,9 +298,26 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
   const lastWakeAtRef = useRef(0);
   const isMicAvailableRef = useRef(false);
   const configuredWakeEngineRef = useRef<WakeEngineChoice>(wakeEngine);
+  // Timestamp of the most recent transition OUT of the "speaking" state.
+  // Used to apply a short cooldown before re-arming the speech wake
+  // recognizer so trailing TTS audio (and any speaker reverb) doesn't
+  // immediately self-trigger a wake the moment we go idle.
+  const speakingExitedAtRef = useRef<number>(0);
+  // Cooldown duration is held in a ref so callbacks below capture the latest
+  // configured value without re-creating on every render.
+  const speakingTailCooldownMsRef = useRef(speakingTailCooldownMs);
+  useEffect(() => { speakingTailCooldownMsRef.current = speakingTailCooldownMs; }, [speakingTailCooldownMs]);
+  // True if the in-flight TTS turn contains "Jarvis" anywhere. The
+  // daemon sets this in tts_start, and may flip false→true mid-turn via
+  // tts_text when a later sentence introduces the wake word. Reset on
+  // tts_end / state→idle. When true, the wake recognizer is suppressed
+  // for the duration of the speaking state. When false, the recognizer
+  // stays running so a real human "Jarvis" can interrupt the reply.
+  const ttsContainsWakeRef = useRef(false);
   const startRecordingRef = useRef<(autoStop?: boolean) => void>(() => {});
   const autoStopRef = useRef(false);
   const cancelTTSRef = useRef<() => void>(() => {});
+  const forceIdleRef = useRef<() => void>(() => {});
 
   // Keep refs in sync with state for use inside callbacks
   useEffect(() => { voiceStateRef.current = voiceState; }, [voiceState]);
@@ -221,6 +325,7 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
   useEffect(() => { isMicAvailableRef.current = isMicAvailable; }, [isMicAvailable]);
   useEffect(() => { configuredWakeEngineRef.current = wakeEngine; }, [wakeEngine]);
   useEffect(() => { speechWakeFatalRef.current = speechWakeFatal; }, [speechWakeFatal]);
+  useEffect(() => { mutedRef.current = muted; }, [muted]);
 
   // Reset fatal state when the user changes engine choice or toggles wake word.
   // A config change is a clear signal that the user wants us to retry.
@@ -372,6 +477,12 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
   }, []);
 
   const shouldSpeechWakeRun = useCallback((): boolean => {
+    // Suppress when a containsWake speaking turn is active — TTS would
+    // self-trigger via mic echo. Suppress during the trailing cooldown
+    // for the same reason. Both are checked here so the onend-driven
+    // restart and the reconcile path agree.
+    if (voiceStateRef.current === "speaking" && ttsContainsWakeRef.current) return false;
+    if (isWithinSpeakingTailCooldown(Date.now(), speakingExitedAtRef.current, speakingTailCooldownMsRef.current)) return false;
     return shouldSpeechWakeBeRunning({
       isMicAvailable: isMicAvailableRef.current,
       wakeWordEnabled: wakeWordEnabledRef.current,
@@ -405,7 +516,19 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
       };
 
       recognition.onresult = (event: SpeechRecognitionEvent) => {
-        if (voiceStateRef.current === "recording" || voiceStateRef.current === "processing") return;
+        // Don't process wakes while we're already capturing the user
+        // (recording owns the transcript recognizer). All other states
+        // — including processing and wake_detected — accept wake events
+        // so "Jarvis" can interrupt mid-thought.
+        const sNow = voiceStateRef.current;
+        if (sNow === "recording") return;
+        // During speaking with "Jarvis" in the TTS text: ignore wake
+        // matches; the recognizer is hearing its own voice through the
+        // speakers. The daemon flips this flag; UI honors it.
+        if (sNow === "speaking" && ttsContainsWakeRef.current) return;
+        // Trailing-tail guard: a short window after exiting a containsWake
+        // speaking turn so trailing TTS audio can't false-trigger.
+        if (isWithinSpeakingTailCooldown(Date.now(), speakingExitedAtRef.current, speakingTailCooldownMsRef.current)) return;
 
         // Strict matcher during speaking to keep TTS echo from self-triggering;
         // loose prefix matcher when idle so "hey jarvis <command>" wakes in one breath.
@@ -423,7 +546,13 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
           lastWakeAtRef.current = now;
 
           console.log(`[Voice] Speech wake phrase detected: "${transcript}"`);
-          if (voiceStateRef.current === "speaking") cancelTTSRef.current();
+          const s = voiceStateRef.current;
+          if (s === "speaking") {
+            cancelTTSRef.current();
+          } else if (s === "processing" || s === "wake_detected") {
+            // Mid-thought interrupt: drop the in-flight turn before re-arming.
+            forceIdleRef.current();
+          }
           setVoiceState("wake_detected");
 
           // Hand the mic off cleanly: wait for the recognizer's own end event
@@ -483,17 +612,29 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
           speechWakeRestartTimerRef.current = null;
         }
         if (wasStopping) return;
-        // Chrome ends continuous sessions ~every 30s; retry if we still need to run.
+        // Chrome ends continuous sessions ~every 30s; retry if we still need
+        // to run. shouldSpeechWakeRun() now also checks the containsWake +
+        // tail-cooldown guards added by Phase 6.8.9.
         if (!shouldSpeechWakeRun()) return;
+        // After a containsWake speaking turn exits, wait out the tail
+        // cooldown so trailing speaker audio can't false-trigger.
+        const sinceExit = Date.now() - speakingExitedAtRef.current;
+        const tailDelay = sinceExit < speakingTailCooldownMsRef.current
+          ? speakingTailCooldownMsRef.current - sinceExit
+          : 0;
         speechWakeRestartTimerRef.current = setTimeout(() => {
           speechWakeRestartTimerRef.current = null;
+          if (!shouldSpeechWakeRun()) return;
           startSpeechWakeIfNeeded();
-        }, 300);
+        }, Math.max(300, tailDelay));
       };
 
       speechWakeRef.current = recognition;
     }
 
+    // shouldSpeechWakeRun() in the reconcile effect already gates the
+    // containsWake / tail-cooldown / recording cases before we get here,
+    // so this is just the start-of-recognizer plumbing.
     try {
       speechWakeRef.current.start();
       speechWakeStateRef.current = "starting";
@@ -527,9 +668,12 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
   // Engine selection effect. Picks which wake engine should own the mic based
   // on config + SpeechRecognition availability + fatal state via the pure
   // selector. Imperatively drives the OpenWakeWord side here; the speech-wake
-  // recognizer is driven by the reconcile effect below.
+  // recognizer is driven by the reconcile effect below. Muting forces "none";
+  // a containsWake speaking turn also forces "none" because TTS playing
+  // "Jarvis" through speakers would self-trigger via the mic.
   useEffect(() => {
-    const active = selectActiveWakeEngine({
+    const blockedBySpeaking = voiceState === "speaking" && ttsContainsWakeRef.current;
+    const active = (muted || blockedBySpeaking) ? "none" : selectActiveWakeEngine({
       isMicAvailable,
       wakeWordEnabled,
       wakeEngine,
@@ -539,14 +683,16 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
     setActiveWakeEngine(active);
     if (active === "openwakeword") startWakeWordEngine();
     else stopWakeWordEngine();
-  }, [isMicAvailable, wakeWordEnabled, wakeEngine, speechWakeFatal, startWakeWordEngine, stopWakeWordEngine, isSpeechRecognitionAvailable]);
+  }, [muted, isMicAvailable, wakeWordEnabled, wakeEngine, voiceState, speechWakeFatal, startWakeWordEngine, stopWakeWordEngine, isSpeechRecognitionAvailable]);
 
   // Single reconcile effect for the Web Speech recognizer. Computes desired
   // running state from inputs and nudges the state machine toward it. Has no
   // cleanup function — transitions are idempotent and the dedicated unmount
-  // effect tears the recognizer down.
+  // effect tears the recognizer down. Gated on `blockedBySpeaking` so a
+  // containsWake speaking turn doesn't echo-trigger.
   useEffect(() => {
-    const shouldRun = shouldSpeechWakeBeRunning({
+    const blockedBySpeaking = voiceState === "speaking" && ttsContainsWakeRef.current;
+    const shouldRun = !muted && !blockedBySpeaking && shouldSpeechWakeBeRunning({
       isMicAvailable,
       wakeWordEnabled,
       voiceState,
@@ -556,7 +702,7 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
     });
     if (shouldRun) startSpeechWakeIfNeeded();
     else stopSpeechWakeIfNeeded();
-  }, [isMicAvailable, wakeWordEnabled, voiceState, wakeEngine, speechWakeFatal, startSpeechWakeIfNeeded, stopSpeechWakeIfNeeded, isSpeechRecognitionAvailable]);
+  }, [muted, isMicAvailable, wakeWordEnabled, voiceState, wakeEngine, speechWakeFatal, startSpeechWakeIfNeeded, stopSpeechWakeIfNeeded, isSpeechRecognitionAvailable]);
 
   // Restart wake word listening when returning to idle (with delay for mic release)
   useEffect(() => {
@@ -580,6 +726,19 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
       return () => clearTimeout(timer);
     }
   }, [voiceState]);
+
+  // Stamp the tail cooldown on exit from a containsWake speaking turn so
+  // the reconcile path can hold off re-arming during trailing TTS audio.
+  // We use a separate effect rather than wiring this into the reconcile
+  // effect so the bookkeeping is contained.
+  useEffect(() => {
+    if (voiceState === "speaking" && ttsContainsWakeRef.current) {
+      return () => {
+        speakingExitedAtRef.current = Date.now();
+      };
+    }
+  }, [voiceState]);
+
 
   // --- TTS Playback ---
   const playNextTTSChunk = useCallback(() => {
@@ -617,14 +776,15 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
     }
   }, [playNextTTSChunk]);
 
-  const handleTTSStart = useCallback((requestId: string) => {
-    console.log("[Voice] TTS start:", requestId);
+  const handleTTSStart = useCallback((requestId: string, containsWake = false) => {
+    console.log("[Voice] TTS start:", requestId, containsWake ? "(contains wake)" : "");
     // Stop any lingering playback from a previous TTS session
     if (ttsPlayingRef.current || ttsQueueRef.current.length > 0) {
       audioContextRef.current?.close();
       audioContextRef.current = null;
     }
     ttsRequestIdRef.current = requestId;
+    ttsContainsWakeRef.current = containsWake;
     ttsQueueRef.current = [];
     ttsPlayingRef.current = false;
     setVoiceState("speaking");
@@ -633,8 +793,33 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
     getAudioContext();
   }, [getAudioContext]);
 
+  const handleTTSContainsWake = useCallback(() => {
+    // The plan is computed by a pure helper so the regression boundary
+    // (cooldown stamp on first flip) is unit-testable without React.
+    const plan = planContainsWakeFlip(ttsContainsWakeRef.current);
+    if (!plan.shouldFlip) return;
+    console.log("[Voice] TTS turn now contains wake — suppressing recognizer");
+    ttsContainsWakeRef.current = true;
+    if (plan.shouldStampCooldown) {
+      // Stamp the trailing-tail cooldown NOW. The exit-stamp effect's
+      // cleanup is registered based on the predicate at setup time, so a
+      // false→true flip mid-turn (writing a ref, not state) leaves no
+      // cleanup registered and the timestamp would never get written on
+      // exit — letting trailing TTS audio re-trigger wake. Stamping here
+      // guarantees the cooldown is honored regardless of effect timing.
+      speakingExitedAtRef.current = Date.now();
+    }
+    if (plan.shouldStopRecognizers) {
+      stopSpeechWakeIfNeeded();
+      if (wakeEngineRef.current) {
+        wakeEngineRef.current.stop().catch(() => {});
+      }
+    }
+  }, [stopSpeechWakeIfNeeded]);
+
   const handleTTSEnd = useCallback(() => {
     ttsRequestIdRef.current = null;
+    ttsContainsWakeRef.current = false;
     // If nothing is playing and queue is empty, transition now
     if (!ttsPlayingRef.current && ttsQueueRef.current.length === 0) {
       setVoiceState("idle");
@@ -647,6 +832,7 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
     ttsQueueRef.current = [];
     ttsPlayingRef.current = false;
     ttsRequestIdRef.current = null;
+    ttsContainsWakeRef.current = false;
     // Close and recreate AudioContext to stop current playback
     audioContextRef.current?.close();
     audioContextRef.current = null;
@@ -696,10 +882,44 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
   }, [voiceState, cancelTTS]);
 
   // --- Send audio to server ---
+  // If the browser SpeechRecognition produced a final transcript during the
+  // recording, prefer it: send `voice_text` (skipping daemon Whisper) because
+  // the browser STT is typically more accurate for short utterances and
+  // matches what the user saw under the orb. Otherwise fall back to uploading
+  // the WAV audio for daemon-side STT.
   const sendAudioToServer = useCallback(() => {
     const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    if (pcmChunksRef.current.length === 0) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      pcmChunksRef.current = [];
+      finalBrowserTranscriptRef.current = "";
+      return;
+    }
+
+    const browserText = finalBrowserTranscriptRef.current.trim();
+    finalBrowserTranscriptRef.current = "";
+
+    // Phase 6.7.C — include the user's current Room (or "home") so the
+    // daemon's classifier can disambiguate utterances that read both as
+    // chat questions and as room actions ("show me active tasks").
+    const currentRoom = getCurrentRoom?.() ?? "home";
+
+    if (browserText) {
+      const requestId = crypto.randomUUID();
+      ws.send(JSON.stringify({
+        type: "voice_text",
+        payload: { requestId, text: browserText, currentRoom },
+        timestamp: Date.now(),
+      }));
+      pcmChunksRef.current = [];
+      setVoiceState("processing");
+      return;
+    }
+
+    if (pcmChunksRef.current.length === 0) {
+      // Nothing to send — return to idle so we don't get stuck on processing.
+      setVoiceState("idle");
+      return;
+    }
 
     const requestId = crypto.randomUUID();
     const wavBuffer = encodeWav(pcmChunksRef.current, sampleRateRef.current);
@@ -707,7 +927,7 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
     // Signal start
     ws.send(JSON.stringify({
       type: "voice_start",
-      payload: { requestId },
+      payload: { requestId, currentRoom },
       timestamp: Date.now(),
     }));
 
@@ -720,7 +940,7 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
 
     pcmChunksRef.current = [];
     setVoiceState("processing");
-  }, [encodeWav, wsRef]);
+  }, [encodeWav, wsRef, getCurrentRoom]);
 
   // --- Stop recording ---
   const stopRecordingInternal = useCallback(() => {
@@ -829,6 +1049,7 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
 
   // --- Public API ---
   const startRecording = useCallback(() => {
+    if (mutedRef.current) return;
     if (voiceStateRef.current !== "idle" && voiceStateRef.current !== "wake_detected") return;
     // Stop wake word mic before starting our recording
     if (wakeEngineRef.current) {
@@ -841,6 +1062,125 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
     if (voiceStateRef.current !== "recording") return;
     stopRecordingInternal();
   }, [stopRecordingInternal]);
+
+  /**
+   * Snap the voice state back to idle, regardless of where it currently is.
+   * Used when a non-streaming server response (e.g. Room navigation that
+   * intercepts the chat path) means no `tts_start` will ever arrive to clear
+   * the `processing` state via the normal lifecycle. Without this, the orb
+   * stays in `thinking` until the 30s safety timeout fires.
+   */
+  const forceIdle = useCallback(() => {
+    // Drain any in-flight TTS just in case
+    ttsQueueRef.current = [];
+    ttsPlayingRef.current = false;
+    ttsRequestIdRef.current = null;
+    setTtsAudioPlaying(false);
+    setVoiceState("idle");
+  }, []);
+
+  useEffect(() => {
+    forceIdleRef.current = forceIdle;
+  }, [forceIdle]);
+
+  // --- Mute toggle (Phase 4A) ---
+  const setMuted = useCallback((next: boolean) => {
+    setMutedState(next);
+    if (next) {
+      // Hard-stop anything in flight when muting.
+      if (voiceStateRef.current === "recording") {
+        stopRecordingInternal();
+      }
+      cancelTTSRef.current();
+      setPartialTranscript("");
+      setMicLevel(0);
+    }
+  }, [stopRecordingInternal]);
+
+  // --- Live partial transcript (Phase 4A) ---
+  // Runs a separate SpeechRecognition during `recording` state purely for
+  // visual feedback under the orb. The daemon-side STT remains authoritative
+  // for what lands in the thread; this is read-only echo.
+  useEffect(() => {
+    const SpeechRecognitionCtor =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognitionCtor) return;
+
+    if (voiceState === "recording" && !mutedRef.current) {
+      // Reset captured transcript at the start of each recording.
+      finalBrowserTranscriptRef.current = "";
+      try {
+        const rec = new SpeechRecognitionCtor();
+        rec.continuous = true;
+        rec.interimResults = true;
+        rec.lang = "en-US";
+        rec.onresult = (event: any) => {
+          // Build the full interim string (for the visual transcript) and
+          // capture finals into the ref so stopRecording can use them as
+          // the upload payload.
+          let interim = "";
+          let finalsAdded = "";
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const result = event.results[i];
+            const text = String(result?.[0]?.transcript ?? "");
+            if (!text) continue;
+            if (result?.isFinal) {
+              finalsAdded += (finalsAdded ? " " : "") + text.trim();
+            } else {
+              interim += text;
+            }
+          }
+          if (finalsAdded) {
+            finalBrowserTranscriptRef.current = (
+              finalBrowserTranscriptRef.current
+                ? finalBrowserTranscriptRef.current + " " + finalsAdded
+                : finalsAdded
+            ).trim();
+          }
+          const display = (finalBrowserTranscriptRef.current + " " + interim).trim();
+          setPartialTranscript(display);
+        };
+        rec.onerror = () => {/* ignore — display path only */};
+        rec.onend = () => {/* will be re-created on next recording */};
+        transcriptRecognizerRef.current = rec;
+        try { rec.start(); } catch {/* race with another recognizer */}
+      } catch {/* ignore */}
+    }
+
+    return () => {
+      const rec = transcriptRecognizerRef.current;
+      if (rec) {
+        try { rec.stop(); } catch {/* ignore */}
+        transcriptRecognizerRef.current = null;
+      }
+      // Drop the partial when leaving recording — the final transcript will
+      // appear in the thread shortly via the chat broadcast.
+      setPartialTranscript("");
+    };
+  }, [voiceState]);
+
+  // --- Mic level meter (Phase 4A) ---
+  // Reuses the silence-detection analyser when present, otherwise zero.
+  // Sampled at 60ms — fast enough to feel live, light enough not to thrash React.
+  useEffect(() => {
+    if (voiceState !== "recording") {
+      setMicLevel(0);
+      return;
+    }
+    const interval = setInterval(() => {
+      const analyser = analyserRef.current;
+      if (!analyser) return;
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(data);
+      // Average magnitude → 0..1 (data is 0..255). Apply mild curve for
+      // visual responsiveness; faint speech still nudges the meter.
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) sum += (data[i] ?? 0);
+      const avg = sum / data.length / 255;
+      setMicLevel(Math.min(1, Math.max(0, Math.pow(avg, 0.7))));
+    }, 60);
+    return () => clearInterval(interval);
+  }, [voiceState]);
 
   // --- Cleanup on unmount ---
   useEffect(() => {
@@ -873,7 +1213,13 @@ export function useVoice({ wsRef, wakeWordEnabled = true, wakeEngine = "openwake
     activeWakeEngine,
     handleTTSBinary,
     handleTTSStart,
+    handleTTSContainsWake,
     handleTTSEnd,
     handleError,
+    muted,
+    setMuted,
+    micLevel,
+    partialTranscript,
+    forceIdle,
   };
 }
