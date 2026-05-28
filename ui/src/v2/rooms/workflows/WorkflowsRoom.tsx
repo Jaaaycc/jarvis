@@ -1,634 +1,599 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+/**
+ * Workflows room (Phase 4 stage 1).
+ *
+ * Shows the user's saved workflows with status + last-run summary, and a
+ * detail panel for the selected flow with its run history. Runs can be
+ * triggered manually; flows can be enabled/disabled, published, or deleted.
+ *
+ * Limitations of this stage (intentional):
+ *   - No visual builder. Flow creation happens via the API or assistant.
+ *   - No NL-create chip. That lands when the assistant tools for workflows
+ *     ship in Phase 5.
+ *   - Step outputs are rendered as JSON. A pretty per-piece renderer is
+ *     deferred until pieces have stable output shapes.
+ */
+
+import React, { useEffect, useMemo, useState } from "react";
 import {
-  Network,
+  AlertTriangle,
+  CheckCircle2,
+  Clock,
   Pause,
+  Pencil,
   Play,
   Plus,
   RefreshCw,
-  Search,
-  Sparkles,
+  Trash2,
+  Upload,
   X,
-  type LucideIcon,
+  XCircle,
 } from "lucide-react";
-import { Chip, Icon } from "../../ui";
+import { WorkflowEditor } from "./WorkflowEditor";
+import { Button, Chip, Icon } from "../../ui";
 import { RoomShell } from "../RoomShell";
 import { useRoomActions } from "../useRoomActionBus";
-import { useRovingTabs } from "../useRovingTabs";
-import { useLiveData } from "../../shell/LiveDataContext";
 import {
   useWorkflowsData,
-  type Workflow,
-  type WorkflowFilter,
+  type Flow,
+  type FlowRun,
+  type FlowRunStatus,
+  type FlowStatus,
 } from "./useWorkflowsData";
-import WorkflowCanvas from "../../../components/workflows/WorkflowCanvas";
-import AgentBuilderView from "../../../components/office/AgentBuilderView";
-// Pull legacy CSS so embedded WorkflowCanvas + AgentBuilderView render correctly.
-import "../../../styles/workflows.css";
-import "../../../styles/agents.css";
 import "./WorkflowsRoom.css";
+import { ConnectionsPanel } from "./ConnectionsPanel";
+import { LibraryPanel } from "./LibraryPanel";
 
-type TabId = "list" | "editor" | "builder";
-
-const FILTER_ORDER: WorkflowFilter[] = ["all", "active", "paused"];
-const FILTER_LABEL: Record<WorkflowFilter, string> = {
-  all: "All",
-  active: "Active",
-  paused: "Paused",
+const STATUS_TONE: Record<FlowStatus, "ok" | "neutral"> = {
+  ENABLED: "ok",
+  DISABLED: "neutral",
 };
 
-const TAB_LABEL: Record<TabId, string> = {
-  list: "List",
-  editor: "Editor",
-  builder: "Agent Builder",
+const RUN_STATUS_TONE: Record<FlowRunStatus, "ok" | "neutral" | "warn" | "accent"> = {
+  QUEUED: "neutral",
+  RUNNING: "warn",
+  SUCCEEDED: "ok",
+  FAILED: "accent",
+  // PAUSED is awaiting an external signal (a hit on the resume webhook).
+  // We render with the `warn` tone instead of neutral so it visually stands
+  // out from idle-but-not-running runs.
+  PAUSED: "warn",
+  TIMEOUT: "accent",
+  INTERNAL_ERROR: "accent",
+  QUOTA_EXCEEDED: "accent",
+  STOPPED: "neutral",
+  MEMORY_LIMIT_EXCEEDED: "accent",
+  SCHEDULE_FAILURE: "accent",
 };
 
-const TAB_ICON: Record<TabId, LucideIcon> = {
-  list: Network,
-  editor: Sparkles,
-  builder: Network,
-};
+const TERMINAL_STATUSES = new Set<FlowRunStatus>([
+  "SUCCEEDED",
+  "FAILED",
+  "STOPPED",
+  "TIMEOUT",
+  "INTERNAL_ERROR",
+  "QUOTA_EXCEEDED",
+  "MEMORY_LIMIT_EXCEEDED",
+  "SCHEDULE_FAILURE",
+]);
 
-export type RoomBodyMode = "inline" | "expanded";
+type RoomTab = "flows" | "connections" | "library";
 
-/**
- * Workflows Room — three-tab surface (List / Editor / Agent Builder).
- *
- * - List: roster + filters + per-row actions; selecting flips to Editor.
- * - Editor: embeds the existing legacy WorkflowCanvas (xyflow) inside a
- *   v2 chrome bar. Empty state when no workflow selected.
- * - Agent Builder: relocated from Phase 6.3 (legacy SVG canvas, ephemeral
- *   state, no daemon persistence per legacy beta behavior).
- *
- * Inline mode collapses to the List tab only — the Editor + Builder canvases
- * need real estate that an inline RoomWindow can't comfortably provide.
- */
-export function WorkflowsRoomBody({ mode }: { mode: RoomBodyMode }) {
+export function WorkflowsRoomBody(): React.ReactElement {
   const data = useWorkflowsData();
-  const live = useLiveData();
-  const [activeTab, setActiveTab] = useState<TabId>("list");
-  const TAB_KEYS = useMemo(() => Object.keys(TAB_LABEL) as TabId[], []);
-  const tabsApi = useRovingTabs<TabId>(TAB_KEYS, activeTab, setActiveTab, "v2-wf");
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState<WorkflowFilter>("all");
-  const [creating, setCreating] = useState(false);
-  const [toast, setToast] = useState<{ text: string; tone: "ok" | "warn" } | null>(null);
+  const [actionMessage, setActionMessage] = useState<{ tone: "ok" | "warn"; text: string } | null>(null);
+  const [tab, setTab] = useState<RoomTab>("flows");
 
-  // Auto-clear toasts.
-  useEffect(() => {
-    if (!toast) return;
-    const id = window.setTimeout(() => setToast(null), 4000);
-    return () => window.clearTimeout(id);
-  }, [toast]);
-
-  const filteredWorkflows = useMemo(() => {
-    let list = data.workflows;
-    if (filter === "active") list = list.filter((w) => w.enabled);
-    else if (filter === "paused") list = list.filter((w) => !w.enabled);
-    const q = search.trim().toLowerCase();
-    if (q) {
-      list = list.filter(
-        (w) =>
-          w.name.toLowerCase().includes(q) ||
-          w.description.toLowerCase().includes(q) ||
-          w.tags.some((t) => t.toLowerCase().includes(q)),
-      );
-    }
-    return list;
-  }, [data.workflows, search, filter]);
-
-  const selectedWorkflow = useMemo(
-    () => (selectedId ? data.workflows.find((w) => w.id === selectedId) ?? null : null),
-    [data.workflows, selectedId],
-  );
-
-  const handleSelect = useCallback((id: string) => {
-    setSelectedId(id);
-    setActiveTab("editor");
-  }, []);
-
-  const handleRun = useCallback(
-    async (id: string) => {
-      const r = await data.execute(id);
-      setToast({ text: r.message, tone: r.ok ? "ok" : "warn" });
-    },
-    [data],
-  );
-
-  const handleTogglePause = useCallback(
-    async (wf: Workflow) => {
-      const r = await data.setEnabled(wf.id, !wf.enabled);
-      setToast({ text: r.message, tone: r.ok ? "ok" : "warn" });
-    },
-    [data],
-  );
-
-  const handleCreate = useCallback(async () => {
-    const name = window.prompt("Workflow name:");
-    if (!name?.trim()) return;
-    setCreating(true);
-    const r = await data.create(name.trim());
-    setCreating(false);
-    if (r.ok) {
-      setToast({ text: `Created "${r.workflow.name}".`, tone: "ok" });
-      handleSelect(r.workflow.id);
-    } else {
-      setToast({ text: r.message, tone: "warn" });
-    }
-  }, [data, handleSelect]);
+  const handleAction = async (label: string, fn: () => Promise<{ ok: boolean; message: string }>): Promise<void> => {
+    const result = await fn();
+    setActionMessage({
+      tone: result.ok ? "ok" : "warn",
+      text: result.ok ? `${label}: ${result.message}` : `${label} failed: ${result.message}`,
+    });
+    window.setTimeout(() => setActionMessage(null), 3000);
+  };
 
   /**
-   * Voice path: create a workflow from a natural-language prompt.
-   *
-   * Two flows:
-   *  - With prompt → POST /api/workflows/nl-create (single LLM call,
-   *    purpose-built `parseDescription` returns a full definition that
-   *    gets persisted as v1). User lands in the editor with a populated
-   *    graph, not a trigger-only stub.
-   *  - Empty prompt → POST /api/workflows (existing trigger-only path)
-   *    so "just make a new empty workflow" still works.
-   *
-   * The earlier two-step "create then nl-chat" path produced empty graphs
-   * because /nl-chat's chat() is biased toward Q&A unless the user
-   * explicitly says "add/remove/modify". parseDescription() doesn't have
-   * that ambiguity.
+   * Create a new flow + jump straight into the visual editor. Rename happens
+   * inside the editor; we don't prompt for a name up front because the user's
+   * intent at this point is to start building, not to bikeshed a label.
    */
-  const createFromNl = useCallback(
-    async (prompt: string) => {
-      const trimmed = prompt.trim();
-      setCreating(true);
-
-      try {
-        if (!trimmed) {
-          // Blank workflow path — same as the legacy create flow.
-          const blankName = `Workflow ${formatHHMM(Date.now())}`;
-          const created = await data.create(blankName);
-          if (!created.ok) {
-            setToast({ text: created.message, tone: "warn" });
-            return;
-          }
-          handleSelect(created.workflow.id);
-          setToast({ text: `Created "${created.workflow.name}".`, tone: "ok" });
-          return;
-        }
-
-        // Populated workflow path.
-        const name = deriveWorkflowName(trimmed);
-        const resp = await fetch("/api/workflows/nl-create", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            name,
-            description: trimmed,
-            prompt: trimmed,
-          }),
-        });
-        if (!resp.ok) {
-          const text = await resp.text();
-          throw new Error(text || `HTTP ${resp.status}`);
-        }
-        const body = (await resp.json()) as {
-          workflow: Workflow;
-          version: { version: number };
-        };
-        // Refresh list so the new workflow appears, then jump to editor.
-        data.refresh();
-        handleSelect(body.workflow.id);
-        setToast({
-          text: `Created "${body.workflow.name}" with the steps from your prompt.`,
-          tone: "ok",
-        });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : "NL create failed";
-        setToast({
-          text: `Couldn't build the workflow: ${msg}`,
-          tone: "warn",
-        });
-      } finally {
-        setCreating(false);
-      }
-    },
-    [data, handleSelect],
-  );
-
-  // Phase 6.3.5 — voice-driven Room actions for Workflows.
-  useRoomActions("workflows", (action, args) => {
-    switch (action) {
-      case "switch_tab": {
-        const t = String(args.tab);
-        if (t === "list" || t === "editor" || t === "builder" || t === "agent_builder") {
-          setActiveTab(t === "agent_builder" ? "builder" : (t as TabId));
-          return true;
-        }
-        return false;
-      }
-      case "search":
-        setSearch(typeof args.query === "string" ? args.query : "");
-        setActiveTab("list");
-        return true;
-      case "set_filter": {
-        const f = String(args.filter);
-        if (f === "all" || f === "active" || f === "paused") {
-          setFilter(f);
-          setActiveTab("list");
-          return true;
-        }
-        return false;
-      }
-      case "select": {
-        const name = typeof args.name === "string" ? args.name : "";
-        const wf = data.findByName(name);
-        if (!wf) return false;
-        handleSelect(wf.id);
-        return true;
-      }
-      case "run": {
-        const name = typeof args.name === "string" ? args.name : "";
-        const wf = name ? data.findByName(name) : selectedWorkflow;
-        if (!wf) return false;
-        handleRun(wf.id);
-        return true;
-      }
-      case "pause": {
-        const name = typeof args.name === "string" ? args.name : "";
-        const wf = name ? data.findByName(name) : selectedWorkflow;
-        if (!wf) return false;
-        if (!wf.enabled) {
-          setToast({ text: `${wf.name} is already paused.`, tone: "ok" });
-          return true;
-        }
-        handleTogglePause(wf);
-        return true;
-      }
-      case "enable": {
-        const name = typeof args.name === "string" ? args.name : "";
-        const wf = name ? data.findByName(name) : selectedWorkflow;
-        if (!wf) return false;
-        if (wf.enabled) {
-          setToast({ text: `${wf.name} is already active.`, tone: "ok" });
-          return true;
-        }
-        handleTogglePause(wf);
-        return true;
-      }
-      case "create_from_nl": {
-        const prompt = typeof args.prompt === "string" ? args.prompt : "";
-        // Fire-and-forget so the synchronous handler can still return true.
-        // The async chain creates a workflow then pushes the prompt
-        // through the NL builder so the user gets a populated definition,
-        // not an empty trigger-only graph.
-        void createFromNl(prompt);
-        return true;
-      }
-      default:
-        return false;
+  const handleCreate = async (): Promise<void> => {
+    const result = await data.createFlow();
+    if (result.ok && result.flowId) {
+      data.setEditingFlowId(result.flowId);
+    } else {
+      setActionMessage({ tone: "warn", text: `Create failed: ${result.message}` });
+      window.setTimeout(() => setActionMessage(null), 3000);
     }
+  };
+
+  // Voice / text-classifier `create_from_nl` room action. With an empty
+  // prompt this is "just give me a new blank workflow" -- same path as the
+  // header button. With a non-empty prompt the user described what the
+  // flow should do; we can't compose from here (no LLM client in the UI),
+  // so we still open a fresh draft and surface a hint pointing them at the
+  // chat agent (which calls `manage_workflow:compose`). Text chat is
+  // already routed there directly by ws-service.
+  useRoomActions("workflows", (action, args) => {
+    if (action !== "create_from_nl") return false;
+    const prompt = typeof args?.prompt === "string" ? args.prompt.trim() : "";
+    void (async () => {
+      await handleCreate();
+      if (prompt) {
+        setActionMessage({
+          tone: "ok",
+          text: `Empty workflow created. To have Jarvis build "${prompt}" for you, ask in chat: "Make a workflow that ${prompt}".`,
+        });
+        window.setTimeout(() => setActionMessage(null), 6000);
+      }
+    })();
+    return true;
   });
 
-  // Live event ping count, for the header stat.
-  const recentEvents = live ? 0 : 0;
-  void recentEvents;
-
   return (
-    <div className={`v2-wf v2-wf--${mode}`}>
-      {/* Stats — both modes */}
-      <div className="v2-wf__stats">
-        <StatCard label="Total" value={data.stats.total} sub={`${data.stats.active} active · ${data.stats.paused} paused`} />
-        <StatCard label="Total runs" value={data.stats.executions.toLocaleString()} sub="across all workflows" />
-        <StatCard
-          label="Active"
-          value={data.stats.active}
-          sub={`${data.stats.total > 0 ? Math.round((data.stats.active / data.stats.total) * 100) : 0}% of total`}
+    <div className="wf-room">
+      {data.editingFlowId ? (
+        <WorkflowEditor
+          flowId={data.editingFlowId}
+          onClose={() => {
+            data.setEditingFlowId(null);
+            // The editor may have renamed the flow or otherwise mutated
+            // the version; force an immediate refresh so the list reflects
+            // those edits without waiting for the polling tick.
+            void data.refresh();
+          }}
         />
-        <StatCard label="Selected" value={selectedWorkflow ? `v${selectedWorkflow.current_version}` : "—"} sub={selectedWorkflow?.name ?? "no selection"} />
-      </div>
-
-      {/* Tabs — expanded only */}
-      {mode === "expanded" && (
-        <div
-          className="v2-wf__tabs"
-          role="tablist"
-          aria-label="Workflows view"
-          ref={tabsApi.tablistRef}
-        >
-          {TAB_KEYS.map((t) => (
-            <button
-              key={t}
-              type="button"
-              className="v2-wf__tab"
-              data-active={activeTab === t}
-              {...tabsApi.getTabProps(t)}
-            >
-              <Icon icon={TAB_ICON[t]} size="sm" />
-              <span>{TAB_LABEL[t]}</span>
-              {t === "list" && (
-                <span className="v2-wf__tab-badge">{filteredWorkflows.length}</span>
-              )}
-              {t === "editor" && selectedWorkflow && (
-                <span className="v2-wf__tab-badge">{selectedWorkflow.name.slice(0, 18)}</span>
-              )}
-            </button>
-          ))}
+      ) : null}
+      <header className="wf-room__header">
+        <div className="wf-room__tabs">
+          <button
+            type="button"
+            className={`wf-room__tab ${tab === "flows" ? "wf-room__tab--active" : ""}`}
+            onClick={() => setTab("flows")}
+          >
+            Workflows
+          </button>
+          <button
+            type="button"
+            className={`wf-room__tab ${tab === "connections" ? "wf-room__tab--active" : ""}`}
+            onClick={() => setTab("connections")}
+          >
+            Connections
+          </button>
+          <button
+            type="button"
+            className={`wf-room__tab ${tab === "library" ? "wf-room__tab--active" : ""}`}
+            onClick={() => setTab("library")}
+          >
+            Library
+          </button>
         </div>
-      )}
+        <div className="wf-room__actions">
+          {tab === "flows" ? (
+            <>
+              <span className="wf-room__count">
+                {data.loading ? "…" : `${data.flows.length} workflow${data.flows.length === 1 ? "" : "s"}`}
+                {data.error ? ` · ${data.error}` : null}
+              </span>
+              <Button variant="ghost" size="sm" onClick={() => void data.refresh()} title="Refresh">
+                <Icon icon={RefreshCw} size={14} /> Refresh
+              </Button>
+              <Button variant="primary" size="sm" onClick={() => void handleCreate()} title="New workflow">
+                <Icon icon={Plus} size={14} /> New workflow
+              </Button>
+            </>
+          ) : null}
+        </div>
+      </header>
 
-      {/* Toolbar — only on list tab */}
-      {(mode === "inline" || activeTab === "list") && (
-        <div className="v2-wf__toolbar">
-          <div className="v2-wf__search">
-            <Icon icon={Search} size="sm" />
-            <input
-              className="v2-wf__search-input"
-              type="text"
-              placeholder="Search workflows…"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              aria-label="Search workflows"
+      {actionMessage ? (
+        <div className={`wf-toast wf-toast--${actionMessage.tone}`}>{actionMessage.text}</div>
+      ) : null}
+
+      {tab === "connections" ? <ConnectionsPanel /> : null}
+      {tab === "library" ? <LibraryPanel /> : null}
+
+      {tab === "flows" ? (
+      <div className="wf-room__layout">
+        <section className="wf-room__list" aria-label="Workflow list">
+          {data.flows.length === 0 && !data.loading ? (
+            <EmptyState onCreate={() => void handleCreate()} />
+          ) : (
+            <ul className="wf-list">
+              {data.flows.map((flow) => (
+                <FlowRow
+                  key={flow.id}
+                  flow={flow}
+                  selected={data.selectedFlowId === flow.id}
+                  triggerWarning={data.triggerWarnings[flow.id]?.warning}
+                  onSelect={() => data.setSelectedFlowId(flow.id)}
+                  onEdit={() => data.setEditingFlowId(flow.id)}
+                  onRun={() => handleAction("Run", () => data.runFlow(flow.id))}
+                  onToggle={() =>
+                    handleAction(
+                      flow.status === "ENABLED" ? "Disable" : "Enable",
+                      () => data.setStatus(flow.id, flow.status === "ENABLED" ? "DISABLED" : "ENABLED"),
+                    )
+                  }
+                  onPublish={() => handleAction("Publish", () => data.publishFlow(flow.id))}
+                  onDelete={() => {
+                    // Spell out what disappears: not just the flow row but
+                    // every draft on it (including per-step sample data the
+                    // user invested time configuring for test-from-here).
+                    // Mentioning sample data explicitly catches the case where
+                    // a user has been iterating in the editor but hasn't
+                    // realized a flow delete wipes the whole version chain.
+                    const hasDraftOnly = !flow.publishedVersionId;
+                    const msg = hasDraftOnly
+                      ? `Delete "${flow.displayName ?? flow.id}"?\n\nThis flow has no published version -- the draft (including any per-step sample data) will be permanently lost.`
+                      : `Delete "${flow.displayName ?? flow.id}"?\n\nThe published version and any draft (including per-step sample data) will be permanently lost.`;
+                    if (window.confirm(msg)) {
+                      void handleAction("Delete", () => data.deleteFlow(flow.id));
+                    }
+                  }}
+                />
+              ))}
+            </ul>
+          )}
+        </section>
+
+        <section className="wf-room__detail" aria-label="Selected flow detail">
+          {data.selectedFlow ? (
+            <FlowDetail
+              flow={data.selectedFlow}
+              runs={data.selectedRuns}
+              onRefreshRuns={() => void data.refreshRuns(data.selectedFlow!.id)}
+              onCancelRun={(runId) => handleAction("Cancel", () => data.cancelRun(runId))}
+              onClose={() => data.setSelectedFlowId(null)}
             />
-          </div>
-          <div className="v2-wf__filter-row" role="tablist" aria-label="Filter by status">
-            {FILTER_ORDER.map((f) => (
-              <button
-                key={f}
-                type="button"
-                className="v2-wf__filter-btn"
-                data-active={filter === f}
-                onClick={() => setFilter(f)}
-                role="tab"
-                aria-selected={filter === f}
-              >
-                {FILTER_LABEL[f]}
-              </button>
-            ))}
-          </div>
-          <button
-            type="button"
-            className="v2-wf__refresh"
-            onClick={data.refresh}
-            aria-label="Refresh"
-            title="Refresh"
-          >
-            <Icon icon={RefreshCw} size="sm" />
-          </button>
-          <button
-            type="button"
-            className="v2-wf__new-btn"
-            onClick={handleCreate}
-            disabled={creating}
-          >
-            <Icon icon={Plus} size="sm" />
-            New
-          </button>
-        </div>
-      )}
-
-      {data.error && <div className="v2-wf__error">{data.error}</div>}
-
-      {/* Content */}
-      {(mode === "inline" || activeTab === "list") && (
-        <ListTab
-          workflows={filteredWorkflows}
-          loading={data.loading}
-          onSelect={handleSelect}
-          onRun={handleRun}
-          onTogglePause={handleTogglePause}
-        />
-      )}
-
-      {mode === "expanded" && activeTab === "editor" && (
-        <EditorTab workflow={selectedWorkflow} />
-      )}
-
-      {mode === "expanded" && activeTab === "builder" && <BuilderTab />}
-
-      {toast && (
-        <div role="status" aria-live="polite" className="v2-wf__toast" data-tone={toast.tone}>
-          {toast.text}
-        </div>
-      )}
+          ) : (
+            <DetailPlaceholder />
+          )}
+        </section>
+      </div>
+      ) : null}
     </div>
   );
 }
 
-/** Overlay-mode wrapper — direct URL / palette Shift+Enter / explicit "expand". */
-export function WorkflowsRoom() {
+export function WorkflowsRoom(): React.ReactElement {
   return (
-    <RoomShell
-      title="Workflows"
-      subtitle="list · editor · agent builder"
-      breadcrumb={["Workflows"]}
-    >
-      <WorkflowsRoomBody mode="expanded" />
+    <RoomShell title="Workflows" subtitle="Saved automations · run history · status" breadcrumb={["Workflows"]}>
+      <WorkflowsRoomBody />
     </RoomShell>
   );
 }
 
-/* ─────────── Subcomponents ─────────── */
+/* --------------------------------------------------------------------- rows */
 
-function StatCard({
-  label,
-  value,
-  sub,
-}: {
-  label: string;
-  value: number | string;
-  sub: string;
-}) {
-  return (
-    <div className="v2-wf__stat">
-      <div className="v2-wf__stat-label">{label}</div>
-      <div className="v2-wf__stat-value">{value}</div>
-      <div className="v2-wf__stat-sub">{sub}</div>
-    </div>
-  );
+interface FlowRowProps {
+  flow: Flow;
+  selected: boolean;
+  /** Set when TriggerManager reported a partial-state warning for this flow. */
+  triggerWarning?: string;
+  onSelect: () => void;
+  onEdit: () => void;
+  onRun: () => void;
+  onToggle: () => void;
+  onPublish: () => void;
+  onDelete: () => void;
 }
 
-function ListTab({
-  workflows,
-  loading,
-  onSelect,
-  onRun,
-  onTogglePause,
-}: {
-  workflows: Workflow[];
-  loading: boolean;
-  onSelect: (id: string) => void;
-  onRun: (id: string) => void;
-  onTogglePause: (wf: Workflow) => void;
-}) {
-  if (loading && workflows.length === 0) {
-    return <div className="v2-wf__empty">Loading workflows…</div>;
-  }
-  if (workflows.length === 0) {
-    return (
-      <div className="v2-wf__empty">
-        No workflows match the current filter. Use <strong>New</strong> to create one.
+function FlowRow({ flow, selected, triggerWarning, onSelect, onEdit, onRun, onToggle, onPublish, onDelete }: FlowRowProps): React.ReactElement {
+  const stop = (e: React.MouseEvent): void => e.stopPropagation();
+  return (
+    <li
+      className={`wf-list__row ${selected ? "wf-list__row--selected" : ""}`}
+      onClick={onSelect}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onSelect();
+        }
+      }}
+    >
+      <div className="wf-list__main">
+        <div className="wf-list__title">{flow.displayName ?? flow.id}</div>
+        <div className="wf-list__meta">
+          <Chip tone={STATUS_TONE[flow.status]}>{flow.status === "ENABLED" ? "Enabled" : "Disabled"}</Chip>
+          {flow.publishedVersionId ? (
+            <Chip tone="ok" dot={false}>Published</Chip>
+          ) : (
+            <Chip tone="warn" dot={false}>Draft only</Chip>
+          )}
+          {triggerWarning ? (
+            // Click toggles an expanded detail below the meta row. Default
+            // collapsed state shows a 50-char preview; expanded shows the
+            // full message inline. Avoids the slow native tooltip + lets
+            // long messages wrap cleanly.
+            <TriggerWarningChip text={triggerWarning} />
+          ) : null}
+          <span className="wf-list__hint">updated {fmtRelative(flow.updated)}</span>
+        </div>
       </div>
-    );
-  }
-  return (
-    <ul className="v2-wf__list" role="list">
-      {workflows.map((wf) => (
-        <WorkflowRow
-          key={wf.id}
-          workflow={wf}
-          onSelect={onSelect}
-          onRun={onRun}
-          onTogglePause={onTogglePause}
-        />
-      ))}
-    </ul>
-  );
-}
-
-function WorkflowRow({
-  workflow,
-  onSelect,
-  onRun,
-  onTogglePause,
-}: {
-  workflow: Workflow;
-  onSelect: (id: string) => void;
-  onRun: (id: string) => void;
-  onTogglePause: (wf: Workflow) => void;
-}) {
-  const lastRun = workflow.last_executed_at
-    ? formatRelative(workflow.last_executed_at)
-    : "never";
-  return (
-    <li className="v2-wf__row" data-active={workflow.enabled}>
-      <button
-        type="button"
-        className="v2-wf__row-main"
-        onClick={() => onSelect(workflow.id)}
-      >
-        <span className="v2-wf__row-name">{workflow.name}</span>
-        {workflow.description && (
-          <span className="v2-wf__row-desc">{workflow.description}</span>
-        )}
-        <span className="v2-wf__row-meta">
-          v{workflow.current_version} · {workflow.execution_count} runs · last: {lastRun}
-          {workflow.tags.length > 0 && <> · {workflow.tags.join(", ")}</>}
-        </span>
-      </button>
-      <Chip tone={workflow.enabled ? "ok" : "neutral"} dot>
-        {workflow.enabled ? "Active" : "Paused"}
-      </Chip>
-      <button
-        type="button"
-        className="v2-wf__row-action"
-        onClick={(e) => {
-          e.stopPropagation();
-          onTogglePause(workflow);
-        }}
-        aria-label={workflow.enabled ? "Pause workflow" : "Enable workflow"}
-        title={workflow.enabled ? "Pause" : "Enable"}
-      >
-        <Icon icon={workflow.enabled ? Pause : Play} size="sm" />
-      </button>
-      <button
-        type="button"
-        className="v2-wf__row-action v2-wf__row-action--primary"
-        onClick={(e) => {
-          e.stopPropagation();
-          onRun(workflow.id);
-        }}
-        aria-label="Run workflow"
-        title="Run now"
-      >
-        <Icon icon={Play} size="sm" />
-        Run
-      </button>
+      <div className="wf-list__buttons" onClick={stop}>
+        <Button variant="ghost" size="sm" onClick={onEdit} title="Open visual editor">
+          <Icon icon={Pencil} size={14} /> Edit
+        </Button>
+        <Button variant="primary" size="sm" onClick={onRun} title="Run now">
+          <Icon icon={Play} size={14} /> Run
+        </Button>
+        <Button variant="ghost" size="sm" onClick={onToggle} title={flow.status === "ENABLED" ? "Disable" : "Enable"}>
+          {flow.status === "ENABLED" ? <Icon icon={Pause} size={14} /> : <Icon icon={Play} size={14} />}
+        </Button>
+        {!flow.publishedVersionId ? (
+          <Button variant="ghost" size="sm" onClick={onPublish} title="Publish latest draft">
+            <Icon icon={Upload} size={14} />
+          </Button>
+        ) : null}
+        <Button variant="danger" size="sm" onClick={onDelete} title="Delete">
+          <Icon icon={Trash2} size={14} />
+        </Button>
+      </div>
     </li>
   );
 }
 
-function EditorTab({ workflow }: { workflow: Workflow | null }) {
-  const live = useLiveData();
-  // workflow_event isn't lifted into LiveDataContext yet — ExecutionMonitor
-  // also subscribes to /api/workflows/:id/executions REST, so the canvas
-  // remains functional. We pass an empty array; the canvas will animate
-  // edges only on REST-backed completion, not live WS.
-  const workflowEvents = useRef<never[]>([]).current;
-  void live;
-
-  if (!workflow) {
-    return (
-      <div className="v2-wf__editor-empty">
-        <Icon icon={Sparkles} size="lg" />
-        <h3>No workflow selected</h3>
-        <p>Pick one from the List tab to open it in the editor.</p>
-      </div>
-    );
-  }
-
+/**
+ * Inline-expanding trigger warning. Replaces the native `title` tooltip
+ * (slow appearance, platform-styled, hard to read with long warnings).
+ * Collapsed: warn-toned chip with "! <50-char preview>". Click expands to
+ * a wrapping detail row below the chip. Click again collapses.
+ *
+ * `stopPropagation` is necessary because the parent flow row uses
+ * `onClick` to select the flow -- without it, expanding the warning would
+ * also select the row.
+ */
+function TriggerWarningChip({ text }: { text: string }): React.ReactElement {
+  const [expanded, setExpanded] = useState(false);
+  const preview = text.length > 50 ? text.slice(0, 47) + "..." : text;
   return (
-    <div className="v2-wf__editor">
-      <div className="v2-wf__editor-head">
-        <span className="v2-wf__editor-title">{workflow.name}</span>
-        <Chip tone={workflow.enabled ? "ok" : "neutral"} dot>
-          {workflow.enabled ? "Active" : "Paused"}
-        </Chip>
-        <span className="v2-wf__editor-version">v{workflow.current_version}</span>
-        <span className="v2-wf__editor-runs">{workflow.execution_count} runs</span>
+    <span className="wf-list__warning-wrap">
+      <Chip
+        tone="warn"
+        dot={false}
+        onClick={(e: React.MouseEvent) => {
+          e.stopPropagation();
+          setExpanded((v) => !v);
+        }}
+      >
+        ! {preview}
+      </Chip>
+      {expanded ? (
+        <span className="wf-list__warning-full" onClick={(e) => e.stopPropagation()}>
+          {text}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
+/* ------------------------------------------------------------------ detail */
+
+interface FlowDetailProps {
+  flow: Flow;
+  runs: FlowRun[];
+  onRefreshRuns: () => void;
+  onCancelRun: (runId: string) => void;
+  onClose: () => void;
+}
+
+function FlowDetail({ flow, runs, onRefreshRuns, onCancelRun, onClose }: FlowDetailProps): React.ReactElement {
+  const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
+  const succeeded = useMemo(() => runs.filter((r) => r.status === "SUCCEEDED").length, [runs]);
+  const failed = useMemo(() => runs.filter((r) => r.status === "FAILED" || r.status === "INTERNAL_ERROR").length, [runs]);
+  return (
+    <div className="wf-detail">
+      <header className="wf-detail__header">
+        <div className="wf-detail__title">
+          <h3>{flow.displayName ?? flow.id}</h3>
+          <p>
+            <code>{flow.id}</code>
+          </p>
+        </div>
+        <Button variant="ghost" size="sm" onClick={onClose} aria-label="Close detail">
+          <Icon icon={X} size={14} />
+        </Button>
+      </header>
+
+      <div className="wf-detail__stats">
+        <Stat label="Runs" value={String(runs.length)} />
+        <Stat label="Succeeded" value={String(succeeded)} tone="ok" />
+        <Stat label="Failed" value={String(failed)} tone={failed > 0 ? "accent" : "neutral"} />
       </div>
-      <div className="v2-wf__editor-canvas">
-        <WorkflowCanvas
-          workflowId={workflow.id}
-          workflowEvents={workflowEvents as never}
-          sendMessage={() => {/* legacy chat hook unused inside Room */}}
-        />
+
+      <div className="wf-detail__runs-header">
+        <h4>Run history</h4>
+        <Button variant="ghost" size="sm" onClick={onRefreshRuns}>
+          <Icon icon={RefreshCw} size={12} />
+        </Button>
       </div>
+
+      {runs.length === 0 ? (
+        <p className="wf-detail__empty">No runs yet. Hit "Run" on the flow to trigger one.</p>
+      ) : (
+        <ul className="wf-runs">
+          {runs.map((run) => (
+            <RunRow
+              key={run.id}
+              run={run}
+              expanded={expandedRunId === run.id}
+              onToggle={() => setExpandedRunId(expandedRunId === run.id ? null : run.id)}
+              onCancel={() => onCancelRun(run.id)}
+            />
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
 
-function BuilderTab() {
+/* --------------------------------------------------------------------- run */
+
+interface RunRowProps {
+  run: FlowRun;
+  expanded: boolean;
+  onToggle: () => void;
+  onCancel: () => void;
+}
+
+function RunRow({ run, expanded, onToggle, onCancel }: RunRowProps): React.ReactElement {
+  const isTerminal = TERMINAL_STATUSES.has(run.status);
+  const duration = run.startTime && run.finishTime ? `${(run.finishTime - run.startTime) / 1000}s` : "—";
   return (
-    <div className="v2-wf__builder">
-      <AgentBuilderView />
-    </div>
+    <li className="wf-runs__row">
+      <button type="button" className="wf-runs__head" onClick={onToggle}>
+        <div className="wf-runs__head-left">
+          <RunStatusIcon status={run.status} />
+          <Chip tone={RUN_STATUS_TONE[run.status]} dot={false}>{run.status}</Chip>
+          {run.failedStep ? <span className="wf-runs__failed-step">@ {run.failedStep.displayName}</span> : null}
+        </div>
+        <div className="wf-runs__head-right">
+          <span className="wf-runs__time">{run.startTime ? fmtClock(run.startTime) : "—"}</span>
+          <span className="wf-runs__duration">{duration}</span>
+        </div>
+      </button>
+      {expanded ? (
+        <div className="wf-runs__body">
+          <dl className="wf-runs__kv">
+            <dt>Run id</dt>
+            <dd><code>{run.id}</code></dd>
+            <dt>Steps</dt>
+            <dd>{run.stepsCount ?? 0}</dd>
+            <dt>Triggered by</dt>
+            <dd>{run.triggeredBy ?? "manual"}</dd>
+          </dl>
+          {run.status === "PAUSED" ? <PausedRunCallout runId={run.id} /> : null}
+          {run.steps && Object.keys(run.steps).length > 0 ? (
+            <details className="wf-runs__steps">
+              <summary>Step output JSON</summary>
+              <pre>{JSON.stringify(run.steps, null, 2)}</pre>
+            </details>
+          ) : null}
+          {!isTerminal ? (
+            <Button variant="danger" size="sm" onClick={onCancel}>
+              <Icon icon={X} size={12} /> Cancel run
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
+    </li>
   );
 }
 
-/* ─────────── helpers ─────────── */
-
-function formatRelative(ts: number): string {
-  const diff = Date.now() - ts;
-  const min = Math.floor(diff / 60000);
-  if (min < 1) return "just now";
-  if (min < 60) return `${min}m ago`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}h ago`;
-  const day = Math.floor(hr / 24);
-  if (day === 1) return "yesterday";
-  return `${day}d ago`;
-}
-
-function formatHHMM(ts: number): string {
-  const d = new Date(ts);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+function RunStatusIcon({ status }: { status: FlowRunStatus }): React.ReactElement {
+  if (status === "SUCCEEDED") return <Icon icon={CheckCircle2} size={14} />;
+  if (status === "FAILED" || status === "INTERNAL_ERROR" || status === "TIMEOUT") return <Icon icon={XCircle} size={14} />;
+  if (status === "RUNNING" || status === "QUEUED") return <Icon icon={Clock} size={14} />;
+  return <Icon icon={AlertTriangle} size={14} />;
 }
 
 /**
- * Derive a short, sentence-cased workflow name from a free-form NL prompt.
- * Drops common stopwords up front ("create / make / a / new / workflow /
- * that / which") so "create a workflow that checks AI news every morning"
- * collapses to "Checks AI news every morning". Capped at ~50 chars.
+ * Paused-run callout: fetches active waitpoints for this run and renders the
+ * resume URL(s) so the user can copy/paste into curl or hit from a webhook
+ * sender. Loads on mount; no re-fetch (the panel is short-lived per
+ * expand). Falls back to a generic message if the run has no active
+ * waitpoint -- which can happen briefly while the engine is between
+ * uploadRunLog calls, or if the run was paused via a non-webhook path.
  */
-function deriveWorkflowName(prompt: string): string {
-  const cleaned = prompt
-    .trim()
-    .replace(
-      /^\s*(?:please\s+)?(?:can\s+you\s+)?(?:just\s+)?(?:make|create|build|set\s*up|add)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?(?:workflow\s+)?(?:that\s+|which\s+|to\s+)?/i,
-      "",
-    )
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!cleaned) return "New workflow";
-  const capped = cleaned.slice(0, 50).replace(/[.,;!?\s]+$/, "");
-  return capped.charAt(0).toUpperCase() + capped.slice(1);
+function PausedRunCallout({ runId }: { runId: string }): React.ReactElement {
+  const [waitpoints, setWaitpoints] = useState<
+    Array<{ id: string; stepName: string; type: string; resumeUrl: string }> | null
+  >(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const r = await fetch(`/api/workflow-runs/${runId}/waitpoints`);
+        if (!r.ok) {
+          setError(`HTTP ${r.status}`);
+          return;
+        }
+        const body = (await r.json()) as {
+          waitpoints: Array<{ id: string; stepName: string; type: string; resumeUrl: string }>;
+        };
+        if (!cancelled) setWaitpoints(body.waitpoints);
+      } catch (e) {
+        if (!cancelled) setError((e as Error).message);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [runId]);
+  return (
+    <div className="wf-runs__paused">
+      <strong>Paused:</strong> waiting for an external signal.{" "}
+      {error ? (
+        <span className="wf-runs__paused-err">Couldn't load waitpoints: {error}</span>
+      ) : waitpoints === null ? (
+        <span>Loading waitpoints…</span>
+      ) : waitpoints.length === 0 ? (
+        <span>
+          No active waitpoints for this run -- it may be parked on a non-webhook
+          pause (TIMER, MANUAL) or transitioning.
+        </span>
+      ) : (
+        <ul className="wf-runs__paused-list">
+          {waitpoints.map((wp) => (
+            <li key={wp.id}>
+              <span className="wf-runs__paused-step">step <code>{wp.stepName}</code></span>{" "}
+              ({wp.type}) -- POST any JSON body to{" "}
+              <code>{wp.resumeUrl}</code> to resume.
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }
 
-// silence unused-import lints
-void X;
+/* ------------------------------------------------------------- placeholders */
+
+function EmptyState({ onCreate }: { onCreate: () => void }): React.ReactElement {
+  return (
+    <div className="wf-empty">
+      <p>No workflows yet.</p>
+      <p className="wf-empty__hint">
+        Start with a blank canvas and add steps as you go.
+      </p>
+      <Button variant="primary" size="sm" onClick={onCreate}>
+        <Icon icon={Plus} size={14} /> New workflow
+      </Button>
+    </div>
+  );
+}
+
+function DetailPlaceholder(): React.ReactElement {
+  return (
+    <div className="wf-detail-placeholder">
+      <p>Select a workflow to see its run history.</p>
+    </div>
+  );
+}
+
+function Stat({ label, value, tone }: { label: string; value: string; tone?: "ok" | "neutral" | "accent" }): React.ReactElement {
+  return (
+    <div className={`wf-stat wf-stat--${tone ?? "neutral"}`}>
+      <div className="wf-stat__value">{value}</div>
+      <div className="wf-stat__label">{label}</div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ format */
+
+function fmtRelative(ms: number): string {
+  const diff = Date.now() - ms;
+  if (diff < 60_000) return "just now";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  return `${Math.floor(diff / 86_400_000)}d ago`;
+}
+
+function fmtClock(ms: number): string {
+  return new Date(ms).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}

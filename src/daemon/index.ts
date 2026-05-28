@@ -36,6 +36,24 @@ import { ApprovalDelivery } from "../authority/approval-delivery.ts";
 import { DeferredExecutor } from "../authority/deferred-executor.ts";
 import { sendDesktopNotification } from "../comms/desktop-notify.ts";
 import { SidecarManager } from "../sidecar/manager.ts";
+import { ensureWorkflowSchema } from "../workflows/db/index.ts";
+import { Worker as WorkflowWorker } from "../workflows/queue/worker.ts";
+import { createRunFlowHandler, RUN_FLOW } from "../workflows/runner/handler.ts";
+import { createWorkflowRoutes } from "../workflows/api/routes.ts";
+import { TriggerManager } from "../workflows/runner/triggers/manager.ts";
+import { AWARENESS_EVENT_TYPE_MAP, OBSERVER_EVENT_TYPE_MAP } from "../workflows/runtime/event-types.ts";
+import { WorkflowEventBus } from "../workflows/runtime/event-bus.ts";
+import { WorkflowEventBuffer } from "../workflows/runtime/event-buffer.ts";
+import {
+  bootstrapWorkflowEngine,
+  type BootstrapWorkflowEngineResult,
+} from "../workflows/runtime/engine-bootstrap.ts";
+import { CredentialResolver } from "../workflows/credentials/adapter.ts";
+import { metadataToCatalogEntry } from "../workflows/runtime/piece-catalog.ts";
+import { DEFAULT_IDS } from "../workflows/db/schema.ts";
+import { apId } from "../workflows/db/ids.ts";
+import { buildSandboxServiceBackends } from "../workflows/runtime/service-backends.ts";
+import { EngineFlowExecutor } from "../workflows/runner/engine-runtime/engine-flow-executor.ts";
 
 // Constants
 const DEFAULT_PORT = 3142;  // JARVIS port
@@ -57,6 +75,9 @@ let commitmentExecutor: CommitmentExecutor | null = null;
 let bgAgent: BackgroundAgentService | null = null;
 let awarenessService: import('../awareness/service.ts').AwarenessService | null = null;
 let goalService: import('../goals/service.ts').GoalService | null = null;
+let workflowWorker: WorkflowWorker | null = null;
+let triggerManager: TriggerManager | null = null;
+let workflowEngineShutdown: (() => Promise<void>) | null = null;
 
 /**
  * Parse command line arguments
@@ -181,7 +202,30 @@ async function handleShutdown(signal: string): Promise<void> {
       await registry.stopAll();
     }
 
-    // Close database
+    // Stop the trigger manager first so no new RUN_FLOW jobs get enqueued
+    // while the worker drains.
+    if (triggerManager) {
+      await triggerManager.stop();
+      triggerManager = null;
+    }
+
+    // Stop the workflow worker (drains in-flight jobs, then exits the poll loop)
+    if (workflowWorker) {
+      await workflowWorker.stop();
+      workflowWorker = null;
+    }
+
+    // Stop the engine SandboxApi server (after the worker has drained, since
+    // an in-flight engine subprocess may still be calling back to it).
+    if (workflowEngineShutdown) {
+      try { await workflowEngineShutdown(); } catch (e) {
+        console.warn(`[Daemon] Workflow engine shutdown failed: ${(e as Error).message}`);
+      }
+      workflowEngineShutdown = null;
+    }
+
+    // Close the shared DB. `closeWorkflowDb` aliases `closeDb` since the
+    // workflow tables live in the same file -- one call is enough.
     closeDb();
     console.log('[Daemon] Database closed');
 
@@ -265,6 +309,13 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     logWithTimestamp(`Initializing database at ${config.dbPath}`);
     initDatabase(config.dbPath);
     logWithTimestamp('Database initialized successfully');
+
+    // 2.1. Add workflow tables (flow / flow_run / flow_version /
+    // app_connection / waitpoint / store_entry / workflow_file /
+    // workflow_job / trigger_event) to the shared Jarvis DB. Idempotent.
+    // Single file => single backup unit.
+    ensureWorkflowSchema();
+    logWithTimestamp('Workflow schema ready');
 
     // 2a. Seed webapp templates (upserts, safe to run every startup)
     const { seedWebappTemplates } = await import('../vault/webapp-template-seeds.ts');
@@ -499,7 +550,180 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       sidecarManager,
     };
     setCorsOrigin(jarvisConfig.daemon.port);
-    const apiRoutes = createApiRoutes(apiContext);
+
+    // Construct the workflow runtime's shared collaborators early so the
+    // route table can carry a TriggerManager reference (used for cron /
+    // webhook / on_event registration after API mutations) and the worker
+    // can pass the SAME event bus + runner instances into piece services.
+    const sharedEventBus = new WorkflowEventBus();
+
+    // Recent-events buffer: the daemon mirrors every workflow-bus publish
+    // into this so the engine-managed `on_event` polling trigger sees the
+    // same stream that legacy direct subscribers do.
+    const workflowEventBuffer = new WorkflowEventBuffer();
+    sharedEventBus.setObserver((eventType, payload) => {
+      workflowEventBuffer.publish(eventType, payload);
+    });
+
+    // Bootstrap the workflow engine: build/locate the bundle, compile pieces,
+    // start the loopback SandboxApi, construct the EngineRuntime, extract the
+    // canonical PieceCatalog. /v1/jarvis/* service backends are wired below
+    // after registry.startAll() so toolRegistry + notifier dependencies are
+    // ready; until then each backend returns 503 (mutation via
+    // api.setServices propagates to live route handlers).
+    //
+    // Bootstrap failure is non-fatal for the daemon as a whole: workflows
+    // are one feature among many (agent, vault, observers, sidecar) and a
+    // bundle / extraction failure shouldn't take all of them offline. We log
+    // a structured error with hints, leave `engineBoot` null, and the
+    // workflow routes / trigger manager / executor are skipped below; other
+    // services keep running.
+    let engineBoot: BootstrapWorkflowEngineResult | null = null;
+    const bootstrapStart = Date.now();
+    // Build the credential resolver early so we can register Jarvis-managed
+    // sources (Google OAuth file, etc.) before pieces start asking for
+    // connections. Each `jarvis:<source>` external id dispatches to the
+    // matching source; non-prefixed ids fall through to the `app_connection`
+    // repo (encrypted at rest).
+    const credentialResolver = new CredentialResolver();
+    if (googleAuth) {
+      const { JarvisGoogleConnectionSource } = await import(
+        "../workflows/credentials/google-source.ts"
+      );
+      credentialResolver.register(new JarvisGoogleConnectionSource(googleAuth));
+      logWithTimestamp(
+        "Workflow credential resolver: registered jarvis:google source",
+      );
+    }
+    // jarvis:telegram bridges the same bot token the daemon's Telegram
+    // adapter is using -- pieces (activepieces telegram-bot, custom flows)
+    // can reference `jarvis:telegram` instead of asking the user to create
+    // a separate app_connection. The closure reads from the live config so
+    // a token rotation + daemon restart picks up automatically.
+    if (jarvisConfig.channels?.telegram?.enabled && jarvisConfig.channels.telegram.bot_token) {
+      const { JarvisTelegramConnectionSource } = await import(
+        "../workflows/credentials/telegram-source.ts"
+      );
+      credentialResolver.register(
+        new JarvisTelegramConnectionSource(
+          () => jarvisConfig.channels?.telegram?.bot_token ?? null,
+        ),
+      );
+      logWithTimestamp(
+        "Workflow credential resolver: registered jarvis:telegram source",
+      );
+    }
+    try {
+      engineBoot = await bootstrapWorkflowEngine({
+        services: {
+          credentialResolver,
+          // eventsPoll is the only backend safely wireable up front (no
+          // dependency on toolRegistry / agentService). The rest land via
+          // api.setServices() after registry.startAll().
+          eventsPoll: async (req) => {
+            const reply = workflowEventBuffer.poll(req);
+            return {
+              events: reply.events.map((ev) => ({
+                id: String(ev.id),
+                eventType: ev.eventType,
+                payload: ev.payload,
+                timestamp: ev.timestamp,
+              })),
+              cursor: reply.cursor,
+            };
+          },
+        },
+        log: (line) => console.log(`[Daemon] ${line}`),
+      });
+      workflowEngineShutdown = engineBoot.shutdown;
+      logWithTimestamp(
+        `Workflow engine bootstrap: ${engineBoot.catalog.list().length} piece(s) catalog'd, ${engineBoot.failures.length} failure(s) in ${Date.now() - bootstrapStart}ms`,
+      );
+      // Surface the artifact identity so users who forgot to rebuild
+      // after editing a piece or the framework see a stale hash at a
+      // glance. Fix is documented in the build:workflows script.
+      logWithTimestamp(
+        `Workflow engine artifacts: bundle=${engineBoot.bundleHash} catalog-cache-key=${engineBoot.catalogCacheKey.slice(0, 16)} (rebuild: bun run build:workflows)`,
+      );
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      console.error(
+        [
+          `[Daemon] Workflow engine failed to start (${Date.now() - bootstrapStart}ms): ${err.message}`,
+          `         Common causes:`,
+          `           - Engine bundle / pieces stale or build failed: rerun \`bun install\` then \`bun run build:workflows\``,
+          `           - Vendored Activepieces tree out of sync: rerun \`bun run scripts/sync-activepieces.ts\``,
+          `           - Disk full or ~/.jarvis/cache unwriteable`,
+          `         Workflow features (/api/workflows/*, manage_workflow tool, cron + on_event triggers) are disabled.`,
+          `         The rest of the daemon (agent, vault, observers) continues to run.`,
+        ].join("\n"),
+      );
+      if (err.stack) console.error(err.stack);
+    }
+
+    // Local var is the concrete `PieceCatalog` (not the structural `PieceLookup`)
+    // so the `onPieceLibraryChanged` callback can call `upsert()` / `remove()`
+    // after runtime installs.
+    const workflowPieceCatalog = engineBoot?.catalog ?? null;
+    const workflowEngineRuntime = engineBoot?.runtime ?? null;
+    const workflowSandboxApi = engineBoot?.api ?? null;
+
+    // Build the trigger manager. With the engine runtime present, polling
+    // triggers go through EXECUTE_TRIGGER_HOOK(ON_ENABLE); without it the
+    // manager's `engineRuntime` slot is unset and on_event flows fall back
+    // to direct event-bus subscription.
+    triggerManager = new TriggerManager({
+      eventBus: sharedEventBus,
+      ...(workflowEngineRuntime ? { engineRuntime: workflowEngineRuntime } : {}),
+    });
+
+    // Mount the daemon's existing routes plus the workflow runtime's routes.
+    // The legacy in-house workflow routes that lived at /api/workflows/* were
+    // removed in the Phase 6 cutover; the new runtime now owns those paths.
+    // onPieceLibraryChanged: extract metadata for a newly-installed piece
+    // and upsert into the running catalog so the flow editor picks it up
+    // without a daemon restart. Skipped if either the catalog or the engine
+    // runtime is missing (engine bootstrap failed earlier -- the install
+    // route still mutated disk; the next daemon start reconciles).
+    const onPieceLibraryChanged =
+      workflowPieceCatalog && workflowEngineRuntime
+        ? async (event: {
+            kind: "installed" | "uninstalled";
+            piece: { npmPackage: string; resolvedVersion: string };
+          }) => {
+            if (event.kind === "uninstalled") {
+              workflowPieceCatalog.remove(event.piece.npmPackage);
+              return;
+            }
+            // Unique runId per acquire so any future parallel installs
+            // (today serialized by the API's library mutex) don't collide on
+            // the engine's runId-keyed state.
+            const handle = await workflowEngineRuntime.acquire({
+              runId: `metadata-extract-runtime-install-${apId()}`,
+              projectId: DEFAULT_IDS.project,
+            });
+            try {
+              const meta = await handle.extractPieceMetadata({
+                pieceName: event.piece.npmPackage,
+                pieceVersion: event.piece.resolvedVersion,
+              });
+              workflowPieceCatalog.upsert(metadataToCatalogEntry(meta));
+            } finally {
+              await handle.release();
+            }
+          }
+        : undefined;
+
+    const apiRoutes = {
+      ...createApiRoutes(apiContext),
+      ...createWorkflowRoutes({
+        triggerManager,
+        credentialResolver,
+        ...(workflowPieceCatalog ? { pieceRegistry: workflowPieceCatalog } : {}),
+        ...(onPieceLibraryChanged ? { onPieceLibraryChanged } : {}),
+        getEventBufferDropped: () => workflowEventBuffer.dropped(),
+      }),
+    };
     wsService.setApiRoutes(apiRoutes);
 
     // Serve dashboard from ui/dist/
@@ -550,6 +774,82 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         toolRegistry.register(requestApprovalTool);
         console.log('[Daemon] Registered request_approval intent-gate tool');
       }
+
+      // Register manage_workflow so the primary agent can list / run / create
+      // workflows from chat. Wired here so the trigger manager (constructed
+      // earlier in step 10.1) is in scope and refreshes happen on enable /
+      // disable / publish / delete.
+      const { createManageWorkflowTool } = await import('../actions/tools/manage-workflow.ts');
+      // Build a minimal piece-side LLM client + tool-registry shim for the
+      // composer. Both are tiny structural wrappers; we no longer need the
+      // legacy `JarvisLlmClient`/`JarvisToolRegistryAdapter` classes since
+      // the engine path is the production runtime.
+      const llmManager = agentService.getLLMManager();
+      const composeLlm = {
+        async chat(input: { prompt: string; system?: string }): Promise<{ text: string }> {
+          const messages: Array<{ role: "system" | "user"; content: string }> = [];
+          if (input.system !== undefined) messages.push({ role: "system", content: input.system });
+          messages.push({ role: "user", content: input.prompt });
+          // Composer expects a complete JSON tree describing the flow.
+          // A realistic flow is 500-2000 output tokens; we ask for 4096
+          // to leave room for verbose pieces (long input schemas, many
+          // steps) without surprise truncation. Ollama's default
+          // `num_predict` is 128 -- truncates every compose reply mid-
+          // JSON and crashes parsing with "Unexpected EOF". Other
+          // providers either have higher defaults or ignore the cap.
+          const reply = await llmManager.chat(messages, { max_tokens: 4096 });
+          // `LLMResponse.content` is the assistant-text field; an earlier
+          // version of this adapter read `reply.text` which doesn't
+          // exist on the provider response shape, so every compose
+          // returned "" and JSON.parse crashed with EOF. Stay strict
+          // here -- if the provider ever returns ContentBlock[] for
+          // text-only completions we want to know.
+          const content = typeof reply.content === "string" ? reply.content : "";
+          return { text: content };
+        },
+      };
+      const composerToolRegistry = toolRegistry
+        ? {
+            listNames: (cat?: string) => toolRegistry.list(cat).map((t) => t.name),
+            // Surface each tool's parameter schema so the composer can wire
+            // correct `params` and reject a jarvis-tool:invoke step that omits a
+            // required param (e.g. content_pipeline needs `action`).
+            listDetailed: (cat?: string) =>
+              toolRegistry.list(cat).map((t) => ({
+                name: t.name,
+                description: t.description,
+                params: Object.entries(t.parameters).map(([name, p]) => ({
+                  name,
+                  type: p.type,
+                  required: p.required,
+                  description: p.description,
+                })),
+              })),
+          }
+        : undefined;
+      const manageWorkflowTool = createManageWorkflowTool({
+        triggerManager: triggerManager ?? undefined,
+        llm: composeLlm,
+        ...(workflowPieceCatalog ? { pieceRegistry: workflowPieceCatalog } : {}),
+        // Surface tool names to the composer so the LLM can compose flows
+        // that integrate with services that aren't first-class pieces (e.g.,
+        // Gmail/Calendar via Jarvis tools).
+        ...(composerToolRegistry ? { toolRegistry: composerToolRegistry } : {}),
+        // Surface the discovered specialist roles so a composed delegate step
+        // can only reference a sub-agent that exists (the LLM otherwise guesses
+        // ids like "researcher" that have no role file). Thunk so it reflects
+        // whatever agentService discovered, regardless of init ordering.
+        specialistRoles: () =>
+          Array.from(agentService.getSpecialists().values()).map((r) => ({
+            id: r.id,
+            name: r.name,
+            description: r.description,
+          })),
+      });
+      if (!toolRegistry.has('manage_workflow')) {
+        toolRegistry.register(manageWorkflowTool);
+        console.log('[Daemon] Registered manage_workflow tool');
+      }
     }
     approvalDelivery.setBroadcaster(wsService);
     approvalDelivery.setChannelSender(channelService);
@@ -560,6 +860,78 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       const text = `[EXECUTED] ${request.tool_name}: ${result.slice(0, 200)}`;
       wsService.broadcastNotification(text, 'normal');
     });
+
+    // 10.1. Workflow runtime: wire `/v1/jarvis/*` service backends and start
+    // the worker that drains workflow_job, driven by the engine-backed
+    // executor. Skipped entirely when `workflowEngineRuntime` is null (engine
+    // bootstrap failed earlier; we logged a structured error there).
+    if (workflowSandboxApi && workflowEngineRuntime) {
+      // M7 hookup: pass orchestrator + specialists + authority components so
+      // `jarvis-agent.delegate` runs the full sub-agent loop (LLM + tool
+      // calls + authority gate). Falls back to single-shot LLM mode inside
+      // buildSandboxServiceBackends if any of these are missing.
+      const agentSpecialists = agentService.getSpecialists();
+      const backends = buildSandboxServiceBackends({
+        credentialResolver: workflowSandboxApi.services.credentialResolver,
+        llmManager: agentService.getLLMManager(),
+        ...(toolRegistry ? { toolRegistry } : {}),
+        channelService,
+        wsService,
+        eventBuffer: workflowEventBuffer,
+        sendDesktop: async (title, body) => {
+          sendDesktopNotification(title, body, { urgency: 'normal' });
+        },
+        agentOrchestrator: agentService.getOrchestrator(),
+        agentSpecialists,
+        authorityEngine,
+        auditTrail,
+        emergencyController,
+        // Give the jarvis-ask piece the same Jarvis-flavoured system
+        // prompt the chat agent uses, so workflow LLM calls answer as
+        // Jarvis rather than as the bare base model. `"workflow"` is the
+        // channel slug -- not a real channel, just a key for personality
+        // overrides if any are configured.
+        buildJarvisSystemPrompt: (userMessage) =>
+          agentService.buildFullSystemPrompt("workflow", userMessage),
+      });
+      workflowSandboxApi.setServices(backends);
+      logWithTimestamp("Workflow engine service backends wired (llm/tools/notify/context/agent/events/workflows)");
+
+      const flowExecutor = new EngineFlowExecutor(workflowEngineRuntime);
+      workflowWorker = new WorkflowWorker({
+        handlers: { [RUN_FLOW]: createRunFlowHandler({ executor: flowExecutor }) },
+      });
+      workflowWorker.start();
+    } else {
+      console.warn("[Daemon] Workflow worker not started -- engine unavailable; queued RUN_FLOW jobs will pile up");
+    }
+
+    // Start the trigger manager: scan ENABLED flows and register cron /
+    // webhook / on_event subscriptions. From this point on, any flow whose
+    // status flips ENABLED via the v2 API gets reconciled by the route
+    // hooks calling `triggerManager.refresh(flowId)`.
+    await triggerManager.start();
+    logWithTimestamp(`Trigger manager started with ${triggerManager.list().length} active subscription(s)`);
+
+    // 10.2. Republish observer events onto the workflow event bus so flows
+    // with `on_event` triggers can fire. Event-type strings follow the
+    // canonical taxonomy in src/workflows/runtime/event-types.ts: each
+    // observer event becomes `observer.<observer_type>` (where the observer's
+    // raw `type` is normalized to snake_case via mapObserverEventType).
+    if (observerService) {
+      const warnedRawTypes = new Set<string>();
+      observerService.setForwardCallback((event) => {
+        const mapped = OBSERVER_EVENT_TYPE_MAP[event.type];
+        const canonical = mapped ?? `observer.${event.type}`;
+        if (!mapped && !warnedRawTypes.has(event.type)) {
+          warnedRawTypes.add(event.type);
+          console.warn(
+            `[Daemon] Observer emitted unknown raw type "${event.type}" — publishing as "${canonical}" but it is not in WORKFLOW_EVENT_TYPES; add a mapping in src/workflows/runtime/event-types.ts so the composer surfaces it.`,
+          );
+        }
+        sharedEventBus.publish(canonical, { ...event.data, _timestamp: event.timestamp });
+      });
+    }
 
     // Phase A — onboarding setup-mode guard for LLM-dependent services.
     // While `setup_completed_at === null` the user hasn't saved an LLM
@@ -614,6 +986,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       if (awarenessService) return;
       try {
         const { AwarenessService } = await import('../awareness/service.ts');
+        const awarenessWarnedTypes = new Set<string>();
         const svc = new AwarenessService(
           jarvisConfig,
           agentService.getLLMManager(),
@@ -633,6 +1006,20 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             }
             // Broadcast to WebSocket clients
             wsService.broadcastAwarenessEvent(event);
+
+            // Republish onto the workflow event bus so flows with `on_event`
+            // triggers (awareness.context_changed, awareness.suggestion_ready, etc.)
+            // can fire on real awareness state. Unknown raw types warn once + fall
+            // back to `awareness.<rawType>` so the bus side never drops events.
+            const mapped = AWARENESS_EVENT_TYPE_MAP[event.type];
+            const canonical = mapped ?? `awareness.${event.type}`;
+            if (!mapped && !awarenessWarnedTypes.has(event.type)) {
+              awarenessWarnedTypes.add(event.type);
+              console.warn(
+                `[Daemon] AwarenessService emitted unknown raw type "${event.type}" — publishing as "${canonical}" but it is not in WORKFLOW_EVENT_TYPES; add a mapping in src/workflows/runtime/event-types.ts so the composer surfaces it.`,
+              );
+            }
+            sharedEventBus.publish(canonical, { ...event.data, _timestamp: event.timestamp });
 
             // Push suggestions as chat notifications + voice + desktop
             if (event.type === 'suggestion_ready') {
@@ -918,70 +1305,8 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       }
     }
 
-    // 10b. Workflow Automation Engine (M14)
-    const workflowConfig = jarvisConfig.workflows;
-    if (workflowConfig?.enabled !== false) {
-      try {
-        const { NodeRegistry } = await import('../workflows/nodes/registry.ts');
-        const { registerBuiltinNodes } = await import('../workflows/nodes/builtin.ts');
-        const { WorkflowEngine } = await import('../workflows/engine.ts');
-        const { TriggerManager } = await import('../workflows/triggers/manager.ts');
-        const { NLWorkflowBuilder } = await import('../workflows/nl-builder.ts');
-        const { WorkflowAutoSuggest } = await import('../workflows/auto-suggest.ts');
-
-        // Create node registry and register all built-in nodes
-        const nodeRegistry = new NodeRegistry();
-        registerBuiltinNodes(nodeRegistry);
-        console.log(`[Daemon] Node registry: ${nodeRegistry.count()} nodes registered`);
-
-        // Create and start workflow engine
-        const wfToolRegistry = orchestrator.getToolRegistry();
-        const workflowEngine = new WorkflowEngine(
-          nodeRegistry,
-          wfToolRegistry ?? new (await import('../actions/tools/registry.ts')).ToolRegistry(),
-          agentService.getLLMManager(),
-        );
-        workflowEngine.setEventCallback((event) => {
-          wsService.broadcastWorkflowEvent(event);
-        });
-        await workflowEngine.start();
-
-        // Create and start trigger manager
-        const triggerManager = new TriggerManager(workflowEngine);
-        await triggerManager.start();
-
-        // Create NL builder and auto-suggest
-        const nlBuilder = new NLWorkflowBuilder(nodeRegistry, agentService.getLLMManager());
-        const autoSuggest = new WorkflowAutoSuggest(nodeRegistry, agentService.getLLMManager());
-
-        // Wire awareness events into auto-suggest
-        if (awarenessService) {
-          // The awareness service emits events that can feed pattern detection
-          console.log('[Daemon] Workflow auto-suggest wired to awareness events');
-        }
-
-        // Register manage_workflow tool so primary agent can create/run workflows from chat
-        const { createManageWorkflowTool } = await import('../actions/tools/workflows.ts');
-        const manageWorkflowTool = createManageWorkflowTool({ workflowEngine, nlBuilder, triggerManager });
-        if (wfToolRegistry) {
-          wfToolRegistry.register(manageWorkflowTool);
-          console.log('[Daemon] manage_workflow tool registered for chat agent');
-        }
-
-        // Wire into API context
-        (apiContext as any).workflowEngine = workflowEngine;
-        (apiContext as any).triggerManager = triggerManager;
-        (apiContext as any).webhookManager = triggerManager.getWebhookManager();
-        (apiContext as any).nodeRegistry = nodeRegistry;
-        (apiContext as any).nlBuilder = nlBuilder;
-        (apiContext as any).autoSuggest = autoSuggest;
-
-        console.log('[Daemon] Workflow engine started (engine + triggers + NL builder + auto-suggest)');
-      } catch (err) {
-        console.error('[Daemon] Workflow engine failed to start:', err instanceof Error ? err.message : err);
-        // Non-fatal — daemon continues without workflows
-      }
-    }
+    // 10b. (legacy workflow engine deleted; the new runtime initialized above
+    //       in step 10.1 owns all workflow execution.)
 
     // 10f. Goal Service (M16)
     const goalsConfig = jarvisConfig.goals;
@@ -1004,23 +1329,9 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
         goalService = goalSvc;
         apiContext.goalService = goalSvc;
 
-        // Wire workflow bridge for daily rhythm
-        try {
-          const { generateRhythmWorkflows, registerGoalWorkflows } = await import('../goals/workflow-bridge.ts');
-          const effectiveConfig = goalsConfig ?? {
-            enabled: true,
-            morning_window: { start: 7, end: 9 },
-            evening_window: { start: 20, end: 22 },
-            accountability_style: 'drill_sergeant' as const,
-            escalation_weeks: { pressure: 1, root_cause: 3, suggest_kill: 4 },
-            auto_decompose: true,
-            calendar_ownership: false,
-          };
-          const rhythmWorkflows = generateRhythmWorkflows(effectiveConfig);
-          if (apiContext.triggerManager) {
-            registerGoalWorkflows(rhythmWorkflows, apiContext.triggerManager as any);
-          }
-        } catch { /* workflow bridge is optional */ }
+        // (Goal -> workflow bridge for daily rhythm has been removed alongside
+        // the legacy engine. Re-add as native flows in the new system if the
+        // morning-plan / evening-review crons are still desired.)
 
         // Register manage_goals tool for chat agent
         try {
@@ -1137,6 +1448,14 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
             );
           } else {
             coalescer.addEvent(evt);
+          }
+          // Republish to the workflow event bus so flows with `on_event`
+          // triggers can react. Map the legacy ObserverEvent.type to the
+          // canonical taxonomy.
+          if (evt.event.type === 'commitment_overdue') {
+            sharedEventBus.publish('commitment.overdue', evt.event.data);
+          } else if (evt.event.type === 'commitment_due_soon') {
+            sharedEventBus.publish('commitment.due_soon', evt.event.data);
           }
         }
 

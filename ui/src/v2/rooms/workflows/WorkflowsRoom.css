@@ -1,897 +1,614 @@
-/* Workflows Room — three-tab surface (List / Editor / Agent Builder).
-   Stats bar + tabs + toolbar match the established Tools/Agents/Logs
-   conventions. The Editor and Builder tabs host legacy canvases inside
-   v2 chrome — the embedded canvases keep their own legacy CSS scoped via
-   their own class names. */
+/* Workflows Room (Phase 4 stage 1) — flow list + run history detail panel.
+   Matches the conventions used by Goals/Tools/Agents (var tokens, paper
+   surfaces, soft rules). */
 
-.v2-wf {
+.wf-room {
   display: flex;
   flex-direction: column;
   height: 100%;
   min-height: 0;
-  position: relative;
+  /* Size against this element's own width, not the viewport. The room is
+     rendered inline inside a narrow thread card (.v2-roomwin__body) as well
+     as full-screen, so viewport media queries can't tell "cramped card" from
+     "wide page". Container queries below key off this width instead. */
+  container-type: inline-size;
+  container-name: wfroom;
 }
 
-/* ── Stats ── */
-
-.v2-wf__stats {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: var(--s-3);
+.wf-room__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   padding: var(--s-4) var(--s-6) var(--s-3);
 }
 
-@media (max-width: 720px) {
-  .v2-wf__stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.wf-room__count {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 0.85rem;
 }
 
-.v2-wf__stat {
+.wf-room__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+/* Narrow card: let tabs + actions wrap onto separate lines instead of
+   squeezing the count label into a two-line wrap between the buttons. */
+@container wfroom (max-width: 560px) {
+  .wf-room__header {
+    flex-wrap: wrap;
+    gap: var(--s-2);
+  }
+  .wf-room__actions { flex-wrap: wrap; }
+}
+
+.wf-toast {
+  margin: 0 var(--s-6) var(--s-3);
+  padding: var(--s-2) var(--s-3);
+  border-radius: var(--r-2);
+  font-size: 0.85rem;
+  border: 1px solid var(--rule-soft);
+  background: var(--paper-2);
+}
+.wf-toast--ok { border-color: var(--accent-ok-soft, #134e4a); color: var(--accent-ok, #5eead4); }
+.wf-toast--warn { border-color: var(--accent-warn-soft, #713f12); color: var(--accent-warn, #fbbf24); }
+
+.wf-room__layout {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: var(--s-4);
+  padding: 0 var(--s-6) var(--s-6);
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* Below ~680px the two-pane split gets too tight (detail column clips its
+   stats + run-history columns), so stack list-over-detail. */
+@container wfroom (max-width: 680px) {
+  .wf-room__layout { grid-template-columns: 1fr; }
+}
+
+.wf-room__list,
+.wf-room__detail {
   background: var(--paper-2);
   border: 1px solid var(--rule-soft);
   border-radius: var(--r-2);
-  padding: var(--s-3) var(--s-4);
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
+  overflow: auto;
+  min-height: 0;
 }
 
-.v2-wf__stat-label {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--ink-3);
-}
+/* ── flow list ── */
 
-.v2-wf__stat-value {
-  font-family: var(--font-display);
-  font-size: var(--text-xl);
-  color: var(--ink);
-  line-height: 1.1;
-}
-
-.v2-wf__stat-sub {
-  font-family: var(--font-sans);
-  font-size: var(--text-xs);
-  color: var(--ink-3);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* ── Tabs ── */
-
-.v2-wf__tabs {
-  display: flex;
-  gap: var(--s-1);
-  padding: 0 var(--s-6);
-  border-bottom: var(--hair-soft);
-}
-
-.v2-wf__tab {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--s-2);
-  padding: var(--s-3) var(--s-3);
-  border: 0;
-  background: transparent;
-  font-family: var(--font-sans);
-  font-size: var(--text-sm);
-  color: var(--ink-3);
-  cursor: pointer;
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
-  transition: color var(--dur-fast) var(--ease-out),
-              border-color var(--dur-fast) var(--ease-out);
-}
-
-.v2-wf__tab:hover { color: var(--ink); }
-
-.v2-wf__tab[data-active="true"] {
-  color: var(--ink);
-  border-bottom-color: var(--accent);
-}
-
-.v2-wf__tab[data-disabled="true"] {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.v2-wf__tab[data-disabled="true"]:hover { color: var(--ink-3); }
-
-.v2-wf__tab:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-  border-radius: var(--r-1);
-}
-
-.v2-wf__tab-badge {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  padding: 1px 6px;
-  border-radius: var(--r-pill);
-  background: var(--paper-3);
-  color: var(--ink-3);
-  letter-spacing: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 140px;
-}
-
-.v2-wf__tab[data-active="true"] .v2-wf__tab-badge {
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
-  color: var(--accent);
-}
-
-/* ── Toolbar (list tab) ── */
-
-.v2-wf__toolbar {
-  display: flex;
-  align-items: center;
-  gap: var(--s-2);
-  padding: var(--s-3) var(--s-6);
-  border-bottom: var(--hair-soft);
-  flex-wrap: wrap;
-}
-
-.v2-wf__search {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--s-2);
-  flex: 1;
-  padding: 6px 10px;
-  background: var(--paper-2);
-  border: 1px solid var(--rule);
-  border-radius: var(--r-pill);
-  color: var(--ink-3);
-  max-width: 360px;
-  min-width: 160px;
-}
-
-.v2-wf__search:focus-within {
-  border-color: var(--ink-3);
-  color: var(--ink-2);
-}
-
-.v2-wf__search-input {
-  flex: 1;
-  border: 0;
-  background: transparent;
-  outline: 0;
-  font-family: var(--font-sans);
-  font-size: var(--text-sm);
-  color: var(--ink);
-}
-
-.v2-wf__search-input::placeholder { color: var(--ink-3); }
-
-.v2-wf__filter-row {
-  display: inline-flex;
-  align-items: center;
-  border: 1px solid var(--rule);
-  border-radius: var(--r-pill);
-  overflow: hidden;
-  background: var(--paper);
-}
-
-.v2-wf__filter-btn {
-  padding: 4px 12px;
-  font-family: var(--font-sans);
-  font-size: var(--text-xs);
-  color: var(--ink-3);
-  background: transparent;
-  border: 0;
-  cursor: pointer;
-  transition: background var(--dur-fast) var(--ease-out),
-              color var(--dur-fast) var(--ease-out);
-}
-
-.v2-wf__filter-btn:hover {
-  background: var(--paper-3);
-  color: var(--ink);
-}
-
-.v2-wf__filter-btn[data-active="true"] {
-  background: var(--ink);
-  color: var(--paper);
-}
-
-.v2-wf__refresh,
-.v2-wf__new-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--s-2);
-  height: 28px;
-  border-radius: var(--r-pill);
-  cursor: pointer;
-  transition: background var(--dur-fast) var(--ease-out),
-              color var(--dur-fast) var(--ease-out);
-  font-family: var(--font-sans);
-  font-size: var(--text-sm);
-}
-
-.v2-wf__refresh {
-  width: 28px;
-  border: 1px solid var(--rule);
-  background: var(--paper);
-  color: var(--ink-2);
-}
-
-.v2-wf__refresh:hover {
-  background: var(--paper-3);
-  color: var(--ink);
-}
-
-.v2-wf__new-btn {
-  padding: 0 12px;
-  background: var(--ink);
-  color: var(--paper);
-  border: 0;
-}
-
-.v2-wf__new-btn:hover { background: var(--ink-2); }
-
-.v2-wf__new-btn:disabled { opacity: 0.5; cursor: default; }
-
-.v2-wf__new-btn:focus-visible,
-.v2-wf__refresh:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-/* ── List ── */
-
-.v2-wf__list {
+.wf-list {
   list-style: none;
   margin: 0;
   padding: 0;
-  flex: 1;
-  overflow-y: auto;
 }
 
-.v2-wf__row {
-  display: grid;
-  grid-template-columns: 1fr auto auto auto;
-  gap: var(--s-3);
+.wf-list__row {
+  display: flex;
   align-items: center;
-  padding: var(--s-3) var(--s-6);
-  border-bottom: var(--hair-soft);
-  transition: background var(--dur-fast) var(--ease-out);
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding: var(--s-3) var(--s-4);
+  border-bottom: 1px solid var(--rule-soft);
+  cursor: pointer;
 }
+.wf-list__row:hover { background: var(--paper-3); }
+.wf-list__row--selected { background: var(--paper-3); border-left: 3px solid var(--accent-1, #5eead4); }
+.wf-list__row:last-child { border-bottom: none; }
 
-.v2-wf__row:hover { background: var(--paper-2); }
-
-.v2-wf__row-main {
+.wf-list__main {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--s-1);
   min-width: 0;
-  text-align: left;
-  background: transparent;
-  border: 0;
-  cursor: pointer;
-  padding: 4px 0;
 }
 
-.v2-wf__row-main:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-  border-radius: var(--r-1);
-}
-
-.v2-wf__row-name {
-  font-family: var(--font-sans);
-  font-size: var(--text-md);
+.wf-list__title {
   font-weight: 500;
-  color: var(--ink);
+  color: var(--ink-1);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.v2-wf__row-desc {
-  font-family: var(--font-sans);
-  font-size: var(--text-xs);
-  color: var(--ink-2);
-  display: -webkit-box;
-  -webkit-line-clamp: 1;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.v2-wf__row-meta {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--ink-3);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.v2-wf__row-action {
-  display: inline-flex;
+.wf-list__meta {
+  display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 6px;
-  height: 28px;
-  padding: 0 10px;
-  background: var(--paper);
-  border: 1px solid var(--rule);
-  border-radius: var(--r-pill);
-  font-family: var(--font-sans);
-  font-size: var(--text-xs);
+  gap: var(--s-2);
+  font-size: 0.78rem;
+  color: var(--ink-2);
+}
+
+.wf-list__hint {
+  color: var(--ink-3);
+}
+
+.wf-list__buttons {
+  display: flex;
+  gap: var(--s-1);
+  flex-shrink: 0;
+}
+
+/* Narrow card: the title + meta + up to 5 action buttons can't sit on one
+   line without colliding. Drop the buttons onto their own row beneath the
+   title/meta and right-align them. */
+@container wfroom (max-width: 560px) {
+  .wf-list__row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--s-2);
+  }
+  .wf-list__buttons {
+    justify-content: flex-end;
+    flex-wrap: wrap;
+  }
+}
+
+/* ── empty / placeholder ── */
+
+.wf-empty,
+.wf-detail-placeholder {
+  padding: var(--s-6);
+  color: var(--ink-2);
+  text-align: center;
+}
+
+.wf-empty p { margin: var(--s-1) 0; }
+.wf-empty__hint { font-size: 0.85rem; color: var(--ink-3); }
+.wf-empty__hint code,
+.wf-list__title code,
+.wf-detail__title code,
+.wf-runs__kv code {
+  background: var(--paper-3);
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 0.78rem;
+}
+
+/* ── detail ── */
+
+.wf-detail {
+  padding: var(--s-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+
+.wf-detail__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--s-2);
+}
+
+.wf-detail__title h3 {
+  margin: 0 0 var(--s-1);
+  font-size: 1rem;
+  color: var(--ink-1);
+}
+
+.wf-detail__title p {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--ink-3);
+}
+
+.wf-detail__stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--s-2);
+}
+
+.wf-stat {
+  background: var(--paper-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  padding: var(--s-2) var(--s-3);
+  text-align: center;
+}
+.wf-stat__value {
+  font-size: 1.1rem;
+  font-weight: 500;
+  color: var(--ink-1);
+}
+.wf-stat__label {
+  font-size: 0.72rem;
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.wf-stat--ok .wf-stat__value { color: var(--accent-ok, #5eead4); }
+.wf-stat--accent .wf-stat__value { color: var(--accent-warn, #fbbf24); }
+
+.wf-detail__runs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.wf-detail__runs-header h4 {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--ink-2);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.wf-detail__empty {
+  margin: 0;
+  padding: var(--s-3);
+  color: var(--ink-3);
+  font-size: 0.85rem;
+}
+
+/* ── run rows ── */
+
+.wf-runs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+}
+
+.wf-runs__row {
+  background: var(--paper-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+}
+
+.wf-runs__head {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+.wf-runs__head:hover { background: var(--paper-2); }
+
+.wf-runs__head-left,
+.wf-runs__head-right {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+/* Let the left group (status chip + failed-step label) absorb the squeeze so
+   the time + duration on the right are always fully visible. */
+.wf-runs__head-left { min-width: 0; }
+.wf-runs__head-right { flex-shrink: 0; }
+
+.wf-runs__time,
+.wf-runs__duration {
+  font-size: 0.78rem;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.wf-runs__failed-step {
+  font-size: 0.75rem;
+  color: var(--ink-3);
+  font-style: italic;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wf-runs__paused {
+  font-size: 0.8rem;
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius-2);
+  padding: var(--s-2);
+  line-height: 1.45;
+}
+.wf-runs__paused code {
+  background: var(--surface-3);
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 0.78rem;
+}
+.wf-runs__paused-err { color: var(--accent-1, #f87171); }
+.wf-runs__paused-list { list-style: disc inside; margin: 6px 0 0; padding: 0; }
+.wf-runs__paused-list li { margin: 2px 0; }
+.wf-runs__paused-step { font-weight: 600; color: var(--ink-1); }
+
+.wf-runs__body {
+  padding: var(--s-2) var(--s-3) var(--s-3);
+  border-top: 1px solid var(--rule-soft);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+}
+
+.wf-runs__kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--s-1) var(--s-3);
+  margin: 0;
+  font-size: 0.8rem;
+}
+.wf-runs__kv dt { color: var(--ink-3); }
+.wf-runs__kv dd { margin: 0; color: var(--ink-2); }
+
+.wf-runs__steps summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  color: var(--ink-2);
+  padding: var(--s-1) 0;
+}
+
+.wf-runs__steps pre {
+  margin: var(--s-1) 0 0;
+  padding: var(--s-2);
+  background: var(--paper-2);
+  color: var(--ink);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-2);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ── Tabs ────────────────────────────────────────────────────────────── */
+
+.wf-room__tabs {
+  display: flex;
+  gap: var(--s-1);
+}
+.wf-room__tab {
+  background: transparent;
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius-2, 6px);
+  padding: 4px 12px;
+  font-size: 0.85rem;
   color: var(--ink-2);
   cursor: pointer;
-  transition: background var(--dur-fast) var(--ease-out),
-              color var(--dur-fast) var(--ease-out);
+}
+.wf-room__tab:hover { background: var(--surface-2); color: var(--ink-1); }
+.wf-room__tab--active {
+  background: var(--surface-3);
+  color: var(--ink-1);
+  border-color: var(--rule-strong, var(--rule-soft));
 }
 
-.v2-wf__row-action:hover {
-  background: var(--paper-3);
-  color: var(--ink);
-}
+/* ── Connections panel ───────────────────────────────────────────────── */
 
-.v2-wf__row-action--primary {
-  background: var(--ink);
-  color: var(--paper);
-  border-color: var(--ink);
-}
+.wf-conn { display: flex; flex-direction: column; gap: var(--s-3); padding: var(--s-3) var(--s-6); }
+.wf-conn__header { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s-3); }
+.wf-conn__title { margin: 0; font-size: 1rem; font-weight: 600; color: var(--ink-1); }
+.wf-conn__subtitle { margin: 2px 0 0; font-size: 0.78rem; color: var(--ink-3); }
+.wf-conn__actions { display: flex; gap: var(--s-1); }
 
-.v2-wf__row-action--primary:hover { background: var(--ink-2); }
-
-.v2-wf__row-action:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-/* ── Editor (embedded WorkflowCanvas) ── */
-
-.v2-wf__editor {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
-
-.v2-wf__editor-head {
+.wf-conn__sources {
   display: flex;
   align-items: center;
-  gap: var(--s-3);
-  padding: var(--s-3) var(--s-6);
-  border-bottom: var(--hair-soft);
-  background: var(--paper-2);
-}
-
-.v2-wf__editor-title {
-  font-family: var(--font-display);
-  font-size: var(--text-lg);
-  color: var(--ink);
-}
-
-.v2-wf__editor-version,
-.v2-wf__editor-runs {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--ink-3);
-}
-
-.v2-wf__editor-canvas {
-  flex: 1;
-  min-height: 0;
-  position: relative;
-  overflow: hidden;
-}
-
-/* The legacy WorkflowCanvas uses absolute fills inside .wf-canvas-layout.
-   Force it to take the full editor area. */
-.v2-wf__editor-canvas .wf-canvas-layout {
-  position: absolute;
-  inset: 0;
-}
-
-.v2-wf__editor-empty {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: var(--s-3);
-  padding: var(--s-8);
-  text-align: center;
-  color: var(--ink-3);
-}
-
-.v2-wf__editor-empty h3 {
-  margin: 0;
-  font-family: var(--font-display);
-  font-size: var(--text-xl);
-  color: var(--ink);
-}
-
-.v2-wf__editor-empty p {
-  margin: 0;
-  font-family: var(--font-sans);
-  font-size: var(--text-sm);
+  flex-wrap: wrap;
+  gap: var(--s-1);
+  padding: var(--s-2);
+  background: var(--surface-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius-2, 6px);
+  font-size: 0.78rem;
   color: var(--ink-2);
-  max-width: 360px;
 }
+.wf-conn__sources-label { font-weight: 600; color: var(--ink-1); }
+.wf-conn__sources-help { color: var(--ink-3); font-style: italic; flex-basis: 100%; }
 
-/* ── Builder (embedded AgentBuilderView) ── */
-
-.v2-wf__builder {
-  flex: 1;
-  min-height: 0;
-  position: relative;
-  overflow: hidden;
-}
-
-/* AgentBuilderView uses .ab-* classes; force its root to fill the area. */
-.v2-wf__builder > * {
-  position: absolute !important;
-  inset: 0;
-}
-
-/* ── Empty / error / toast ── */
-
-.v2-wf__empty {
-  padding: var(--s-8) var(--s-4);
+.wf-conn__empty {
+  padding: var(--s-4);
   text-align: center;
-  font-family: var(--font-sans);
-  font-size: var(--text-sm);
   color: var(--ink-3);
+  border: 1px dashed var(--rule-soft);
+  border-radius: var(--radius-2, 6px);
+  font-size: 0.85rem;
 }
 
-.v2-wf__error {
-  padding: var(--s-3) var(--s-6);
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-  color: var(--accent);
-  font-family: var(--font-sans);
-  font-size: var(--text-xs);
-  border-bottom: var(--hair-soft);
+.wf-conn__list { display: flex; flex-direction: column; gap: var(--s-2); list-style: none; padding: 0; margin: 0; }
+.wf-conn__row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius-2, 6px);
+  background: var(--surface-1);
+}
+.wf-conn__row-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+}
+.wf-conn__row-actions { display: flex; gap: var(--s-1); }
+.wf-conn__row-main { display: flex; align-items: center; gap: var(--s-2); flex-wrap: wrap; }
+.wf-conn__row-name { font-weight: 600; color: var(--ink-1); }
+.wf-conn__row-extid { font-family: monospace; font-size: 0.78rem; color: var(--ink-3); }
+.wf-conn__row-meta { display: flex; gap: var(--s-3); font-size: 0.72rem; color: var(--ink-3); }
+.wf-conn__row-meta code { font-size: 0.7rem; }
+.wf-conn__form--inline { background: var(--surface-1); border: 1px dashed var(--rule-soft); }
+
+.wf-conn__form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  padding: var(--s-3);
+  background: var(--surface-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius-2, 6px);
+}
+.wf-conn__form-row { display: flex; gap: var(--s-2); flex-wrap: wrap; }
+.wf-conn__form label { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 180px; font-size: 0.78rem; color: var(--ink-2); }
+.wf-conn__form input,
+.wf-conn__form select,
+.wf-conn__form textarea {
+  background: var(--surface-1);
+  border: 1px solid var(--rule-soft);
+  color: var(--ink-1);
+  padding: 6px 8px;
+  border-radius: var(--radius-2, 6px);
+  font-size: 0.85rem;
+}
+.wf-conn__form textarea { font-family: monospace; font-size: 0.78rem; }
+.wf-conn__form-value { display: flex; flex-direction: column; gap: 4px; }
+.wf-conn__form-err { color: var(--accent-1, #f87171); font-size: 0.72rem; }
+.wf-conn__form-actions { display: flex; justify-content: flex-end; }
+
+/* Library panel: curated activepieces community pieces, install/uninstall. */
+.wf-lib { display: flex; flex-direction: column; gap: var(--s-3); padding: var(--s-3) var(--s-6); }
+.wf-lib__header { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s-3); }
+.wf-lib__title { margin: 0; font-size: 1rem; font-weight: 600; color: var(--ink-1); }
+.wf-lib__subtitle { margin: 2px 0 0; font-size: 0.78rem; color: var(--ink-3); }
+.wf-lib__actions { display: flex; gap: var(--s-1); }
+.wf-lib__intro {
+  margin: 0 0 var(--s-2);
+  font-size: 0.78rem;
+  color: var(--ink-3);
+  line-height: 1.5;
+}
+.wf-lib__intro code { font-family: monospace; font-size: 0.74rem; color: var(--ink-2); }
+.wf-lib__empty {
+  padding: var(--s-4);
+  text-align: center;
+  color: var(--ink-3);
+  font-size: 0.85rem;
+}
+.wf-lib__empty-section {
+  padding: var(--s-3);
+  color: var(--ink-3);
+  font-size: 0.82rem;
+  font-style: italic;
 }
 
-.v2-wf__toast {
-  position: absolute;
-  right: var(--s-4);
-  bottom: var(--s-4);
-  padding: var(--s-3) var(--s-4);
-  background: var(--ink);
-  color: var(--paper);
-  font-family: var(--font-sans);
-  font-size: var(--text-sm);
+/* Search input sits between the header and the tier sections. */
+.wf-lib__search {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--paper-2);
+  border: 1px solid var(--rule-soft);
   border-radius: var(--r-2);
-  box-shadow: 0 6px 20px -10px rgba(26, 26, 26, 0.4);
-  max-width: 360px;
-  z-index: 5;
-}
-
-.v2-wf__toast[data-tone="warn"] { background: var(--accent); }
-
-/* ── Inline mode adjustments ── */
-
-.v2-wf--inline .v2-wf__stats {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  padding: var(--s-3) var(--s-4) var(--s-2);
-}
-
-.v2-wf--inline .v2-wf__toolbar {
-  padding: var(--s-2) var(--s-4);
-}
-
-.v2-wf--inline .v2-wf__row {
-  padding: var(--s-3) var(--s-4);
-  grid-template-columns: 1fr auto;
-}
-
-.v2-wf--inline .v2-wf__row-action {
-  display: none;
-}
-
-/* ── Embedded legacy retheming ─────────────────────────────────────
-   The legacy WorkflowCanvas (xyflow) and AgentBuilderView use a dark-
-   theme design system scoped under `.wf-page` / `.ag-builder-shell`.
-   In v2 we mount them outside those scopes, so their `--surface-X` /
-   `--text-X` / `--border-X` tokens are unset — components render
-   transparent or against the bone-paper background, looking greyed-out.
-   These overrides remap the legacy token namespace to v2 riso tokens
-   so the embedded canvases match the rest of the app.
-   ────────────────────────────────────────────────────────────────── */
-
-.v2-wf__editor-canvas,
-.v2-wf__builder {
-  --surface-1: var(--paper);
-  --surface-2: var(--paper-2);
-  --surface-3: var(--paper-3);
-  --surface-4: var(--paper-3);
-
-  --border-1: var(--rule-soft);
-  --border-2: var(--rule);
-  --border-3: var(--rule);
-
-  --text-1: var(--ink);
-  --text-2: var(--ink-2);
-  --text-3: var(--ink-3);
-
-  /* Riso has one accent — vermilion. Keep the legacy named colors so
-     status pips render, but bias them toward the riso palette. */
-  --violet: var(--accent);
-  --violet-bright: var(--accent);
-  --violet-dim: color-mix(in srgb, var(--accent) 12%, transparent);
-
-  --emerald: var(--ok);
-  --emerald-dim: color-mix(in srgb, var(--ok) 12%, transparent);
-
-  --blue: var(--ink-2);
-  --blue-dim: color-mix(in srgb, var(--ink-2) 12%, transparent);
-
-  --amber: var(--warn);
-  --amber-dim: color-mix(in srgb, var(--warn) 12%, transparent);
-
-  --rose: var(--accent);
-  --rose-dim: color-mix(in srgb, var(--accent) 12%, transparent);
-
-  --cyan: var(--ink-2);
-  --cyan-dim: color-mix(in srgb, var(--ink-2) 10%, transparent);
-
-  background: var(--paper);
   color: var(--ink);
+  font-size: 0.85rem;
+  font-family: var(--font-sans);
+  box-sizing: border-box;
+}
+.wf-lib__search:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 0;
+  border-color: var(--accent);
 }
 
-/* xyflow canvas — readable backgrounds + visible edges/handles. */
-.v2-wf__editor-canvas .react-flow,
-.v2-wf__editor-canvas .react-flow__background,
-.v2-wf__editor-canvas .react-flow__pane {
-  background: var(--paper);
+/* Tier sections (Verified / Community). Each has a small heading + hint,
+   and the community section is a button so it can collapse. */
+.wf-lib__section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  margin-bottom: var(--s-3);
 }
-
-/* Dot grid against bone paper — was rgba-white, invisible. */
-.v2-wf__editor-canvas .react-flow__background-pattern {
-  color: var(--rule);
-}
-
-.v2-wf__editor-canvas .react-flow__controls,
-.v2-wf__editor-canvas .react-flow__minimap {
-  background: var(--paper-2) !important;
-  border: 1px solid var(--rule) !important;
-  box-shadow: 0 4px 16px -10px rgba(26, 26, 26, 0.18) !important;
-}
-
-.v2-wf__editor-canvas .react-flow__controls-button {
-  background: var(--paper-2) !important;
-  border-color: var(--rule) !important;
-  fill: var(--ink-2) !important;
-  color: var(--ink-2) !important;
-}
-
-.v2-wf__editor-canvas .react-flow__controls-button:hover {
-  background: var(--paper-3) !important;
-  fill: var(--ink) !important;
-  color: var(--ink) !important;
-}
-
-/* WorkflowNode — paper card with riso border/typography. */
-.v2-wf__editor-canvas .wf-node {
-  background: var(--paper) !important;
-  border: 1px solid var(--rule) !important;
-  color: var(--ink) !important;
-  box-shadow: 0 4px 14px -10px rgba(26, 26, 26, 0.14) !important;
-  border-radius: var(--r-2) !important;
-}
-
-.v2-wf__editor-canvas .wf-node.selected {
-  border-color: var(--accent) !important;
-  box-shadow: 0 0 0 1px var(--accent), 0 4px 14px -10px rgba(26, 26, 26, 0.18) !important;
-}
-
-.v2-wf__editor-canvas .wf-node-header {
-  border-bottom: 1px solid var(--rule-soft) !important;
-}
-
-.v2-wf__editor-canvas .wf-node-header-label {
-  color: var(--ink) !important;
-}
-
-.v2-wf__editor-canvas .wf-node-body,
-.v2-wf__editor-canvas .wf-node-field,
-.v2-wf__editor-canvas .wf-node-field-key,
-.v2-wf__editor-canvas .wf-node-field-overflow {
-  color: var(--ink-2) !important;
-}
-
-.v2-wf__editor-canvas .wf-node-field-key {
-  color: var(--ink-3) !important;
-}
-
-/* Edges — JS sets stroke inline (`rgba(255,255,255,0.15)`), so we
-   need !important on the path itself, not just the wrapper. */
-.v2-wf__editor-canvas .react-flow__edge-path,
-.v2-wf__editor-canvas .react-flow__edge .react-flow__edge-path {
-  stroke: var(--ink-3) !important;
-  stroke-width: 1.5 !important;
-}
-
-.v2-wf__editor-canvas .react-flow__edge.animated .react-flow__edge-path,
-.v2-wf__editor-canvas .react-flow__edge[data-animated="true"] .react-flow__edge-path {
-  stroke: var(--accent) !important;
-  stroke-width: 2 !important;
-}
-
-.v2-wf__editor-canvas .react-flow__edge.selected .react-flow__edge-path {
-  stroke: var(--ink) !important;
-  stroke-width: 2 !important;
-}
-
-/* Connection-in-progress drag line. */
-.v2-wf__editor-canvas .react-flow__connection-path {
-  stroke: var(--accent) !important;
-  stroke-width: 2 !important;
-}
-
-/* Handles — JS sets `background: rgba(255,255,255,0.08)` and a dark
-   `border: 2px solid var(--surface-2, #0D0D14)` inline. !important
-   wins. Inputs are subtle ink dots; outputs match the node accent
-   color but stay visible against paper. */
-.v2-wf__editor-canvas .react-flow__handle {
-  background: var(--ink-2) !important;
-  border: 2px solid var(--paper) !important;
-  width: 10px !important;
-  height: 10px !important;
-}
-
-.v2-wf__editor-canvas .react-flow__handle-connecting {
-  background: var(--accent) !important;
-}
-
-.v2-wf__editor-canvas .react-flow__handle-valid {
-  background: var(--ok) !important;
-}
-
-/* Palette — hardcoded white-on-dark hover and disabled badge. */
-.v2-wf__editor-canvas .wf-palette {
-  background: var(--paper-2) !important;
-  border-right-color: var(--rule) !important;
-  color: var(--ink) !important;
-}
-
-.v2-wf__editor-canvas .wf-palette-header,
-.v2-wf__editor-canvas .wf-palette-search {
-  border-color: var(--rule-soft) !important;
-}
-
-.v2-wf__editor-canvas .wf-palette-search {
-  background: var(--paper) !important;
-  color: var(--ink) !important;
-}
-
-.v2-wf__editor-canvas .wf-palette-search::placeholder {
-  color: var(--ink-3) !important;
-}
-
-.v2-wf__editor-canvas .wf-palette-label,
-.v2-wf__editor-canvas .wf-palette-category {
-  color: var(--ink-3) !important;
-  font-family: var(--font-mono) !important;
-  letter-spacing: 0.1em;
+.wf-lib__section-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ink-1);
   text-transform: uppercase;
+  letter-spacing: 0.05em;
 }
-
-.v2-wf__editor-canvas .wf-palette-node {
-  border-color: transparent !important;
-  color: var(--ink-2) !important;
+.wf-lib__section-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ink-1);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  font-family: var(--font-sans);
 }
-
-.v2-wf__editor-canvas .wf-palette-node:hover {
-  background: var(--paper-3) !important;
-  color: var(--ink) !important;
+.wf-lib__section-toggle:hover { color: var(--ink); }
+.wf-lib__section-count {
+  font-weight: 400;
+  font-size: 0.7rem;
+  color: var(--ink-3);
+  letter-spacing: 0;
+  padding: 1px 6px;
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r-pill);
+  background: var(--paper-2);
+  text-transform: none;
 }
-
-.v2-wf__editor-canvas .wf-palette-node-name {
-  color: var(--ink) !important;
+.wf-lib__section-hint {
+  margin: 0;
+  font-size: 0.76rem;
+  color: var(--ink-3);
+  line-height: 1.45;
 }
-
-.v2-wf__editor-canvas .wf-palette-node-icon {
-  /* The legacy palette tints icons with the node's own color. Force
-     a neutral chip so the riso accent stays the only saturated color. */
-  background: var(--paper-3) !important;
-  color: var(--ink-2) !important;
+.wf-lib__section-hint--warn {
+  padding: var(--s-2) var(--s-3);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--r-2);
 }
-
-.v2-wf__editor-canvas .wf-palette-empty {
-  color: var(--ink-3) !important;
+.wf-lib__list { display: flex; flex-direction: column; gap: var(--s-2); list-style: none; padding: 0; margin: 0; }
+.wf-lib__row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding: var(--s-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--radius-2, 6px);
+  background: var(--surface-1);
 }
+.wf-lib__row-main { display: flex; flex-direction: column; gap: 4px; flex: 1 1 auto; min-width: 0; }
+.wf-lib__row-title { display: flex; align-items: center; gap: var(--s-1); flex-wrap: wrap; }
+.wf-lib__row-name { font-weight: 600; color: var(--ink-1); }
+.wf-lib__row-desc { margin: 0; font-size: 0.82rem; color: var(--ink-2); line-height: 1.4; }
+.wf-lib__row-meta { display: flex; gap: var(--s-2); font-size: 0.72rem; color: var(--ink-3); align-items: center; flex-wrap: wrap; }
+.wf-lib__row-pkg { font-family: monospace; font-size: 0.72rem; color: var(--ink-3); }
+.wf-lib__row-source { display: inline-flex; gap: 3px; align-items: center; color: var(--ink-3); text-decoration: none; }
+.wf-lib__row-source:hover { color: var(--ink-1); }
+.wf-lib__row-actions { display: flex; gap: var(--s-1); flex-shrink: 0; }
 
-/* Right panel + tabs */
-.v2-wf__editor-canvas .wf-right-panel {
-  background: var(--paper-2) !important;
-  border-left-color: var(--rule) !important;
-  color: var(--ink) !important;
-}
-
-.v2-wf__editor-canvas .wf-panel-tabs {
-  border-bottom-color: var(--rule-soft) !important;
-}
-
-.v2-wf__editor-canvas .wf-panel-tab {
-  color: var(--ink-3) !important;
-  background: transparent !important;
-}
-
-.v2-wf__editor-canvas .wf-panel-tab:hover {
-  color: var(--ink) !important;
-  background: var(--paper-3) !important;
-}
-
-.v2-wf__editor-canvas .wf-panel-tab.active {
-  color: var(--ink) !important;
-  border-bottom: 2px solid var(--accent) !important;
-}
-
-.v2-wf__editor-canvas .wf-panel-placeholder {
-  color: var(--ink-3) !important;
-}
-
-/* Disabled badge in canvas header (if rendered) */
-.v2-wf__editor-canvas .wf-canvas-badge.disabled {
-  background: var(--paper-3) !important;
-  color: var(--ink-3) !important;
-}
-
-/* Hover row highlight in execution monitor */
-.v2-wf__editor-canvas .wf-exec-header:hover {
-  background: var(--paper-3) !important;
-}
-
-/* ── Agent Builder ── */
-
-.v2-wf__builder .ag-builder-shell {
-  height: 100%;
-  background: var(--paper) !important;
-  color: var(--ink) !important;
-}
-
-.v2-wf__builder .ag-builder-sidebar,
-.v2-wf__builder .ag-builder-inspector {
-  background: var(--paper-2) !important;
-  border-color: var(--rule) !important;
-  color: var(--ink) !important;
-}
-
-.v2-wf__builder .ag-builder-title {
-  color: var(--ink) !important;
-}
-
-.v2-wf__builder .ag-builder-eyebrow {
-  color: var(--ink-3) !important;
-}
-
-.v2-wf__builder .ag-builder-copy {
-  color: var(--ink-2) !important;
-}
-
-.v2-wf__builder .ag-builder-stat {
-  background: var(--paper) !important;
-  border-color: var(--rule-soft) !important;
-}
-
-.v2-wf__builder .ag-builder-stat span {
-  color: var(--ink) !important;
-}
-
-.v2-wf__builder .ag-builder-stat strong {
-  color: var(--ink-3) !important;
-}
-
-/* Palette items — hardcoded violet rgba hover, override to accent. */
-.v2-wf__builder .ag-builder-palette-item {
-  background: var(--paper) !important;
-  border-color: var(--rule) !important;
-  color: var(--ink-2) !important;
-}
-
-.v2-wf__builder .ag-builder-palette-item:hover {
-  background: color-mix(in srgb, var(--accent) 6%, var(--paper)) !important;
-  border-color: var(--accent) !important;
-}
-
-.v2-wf__builder .ag-builder-palette-item strong {
-  color: var(--ink) !important;
-}
-
-.v2-wf__builder .ag-builder-palette-item small {
-  color: var(--ink-3) !important;
-}
-
-/* Action buttons (primary/secondary) */
-.v2-wf__builder .ag-builder-action {
-  border-radius: var(--r-pill) !important;
-  font-family: var(--font-sans) !important;
-}
-
-.v2-wf__builder .ag-builder-primary {
-  background: var(--ink) !important;
-  color: var(--paper) !important;
-  border-color: var(--ink) !important;
-}
-
-.v2-wf__builder .ag-builder-secondary {
-  background: var(--paper-2) !important;
-  color: var(--ink-2) !important;
-  border-color: var(--rule) !important;
-}
-
-/* Canvas + nodes — the main visual offenders. */
-.v2-wf__builder .ag-builder-canvas {
-  background: var(--paper-2) !important;
-}
-
-.v2-wf__builder .ag-builder-canvas-stage {
-  background: var(--paper) !important;
-}
-
-.v2-wf__builder .ag-builder-node {
-  background: var(--paper) !important;
-  border: 1px solid var(--rule) !important;
-  box-shadow: 0 4px 14px -10px rgba(26, 26, 26, 0.16) !important;
-  color: var(--ink) !important;
-  border-radius: var(--r-2) !important;
-}
-
-.v2-wf__builder .ag-builder-node:hover,
-.v2-wf__builder .ag-builder-node.selected {
-  border-color: var(--accent) !important;
-  box-shadow: 0 4px 16px -10px rgba(26, 26, 26, 0.2),
-              0 0 0 1px var(--accent) inset !important;
-}
-
-.v2-wf__builder .ag-builder-node.connecting {
-  border-color: var(--accent) !important;
-  box-shadow: 0 0 0 2px var(--accent) inset !important;
-}
-
-.v2-wf__builder .ag-builder-node-eyebrow {
-  color: var(--accent) !important;
-  font-family: var(--font-mono) !important;
-}
-
-.v2-wf__builder .ag-builder-node-title {
-  color: var(--ink) !important;
-}
-
-.v2-wf__builder .ag-builder-node-subtitle {
-  color: var(--ink-2) !important;
-}
-
-.v2-wf__builder .ag-builder-node-chip {
-  background: var(--paper-3) !important;
-  color: var(--ink-2) !important;
-}
-
-/* SVG edges — hardcoded rgba violet/cyan, override to riso. */
-.v2-wf__builder .ag-builder-line {
-  stroke: var(--ink-3) !important;
-  stroke-dasharray: 5 5 !important;
-}
-
-.v2-wf__builder .ag-builder-line.selected {
-  stroke: var(--accent) !important;
-  stroke-dasharray: none !important;
-}
-
-.v2-wf__builder .ag-builder-line-label {
-  fill: var(--ink-3) !important;
-}
-
-/* Empty canvas hint */
-.v2-wf__builder .ag-builder-empty-canvas,
-.v2-wf__builder .ag-builder-empty-title,
-.v2-wf__builder .ag-builder-empty-copy {
-  color: var(--ink-2) !important;
-}
-
-.v2-wf__builder .ag-builder-empty-title {
-  color: var(--ink) !important;
-  font-family: var(--font-display) !important;
+/* Inline-expanding trigger warning: click the chip to reveal the full
+   message below in a wrapping detail line. Beats the native title tooltip
+   for long messages. */
+.wf-list__warning-wrap { display: inline-flex; flex-direction: column; gap: 4px; }
+.wf-list__warning-wrap .chip { cursor: pointer; }
+.wf-list__warning-full {
+  font-size: 0.78rem;
+  color: var(--ink-2);
+  background: var(--paper-3);
+  border-left: 2px solid var(--accent-warn, #fbbf24);
+  border-radius: 0 var(--r-2) var(--r-2) 0;
+  padding: 4px 8px;
+  max-width: 100%;
+  white-space: normal;
+  word-break: break-word;
+  line-height: 1.4;
 }
