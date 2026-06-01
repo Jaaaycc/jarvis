@@ -220,7 +220,7 @@ describe("Engine end-to-end (G+H pieces)", () => {
     notify: Array<{ message: string }>;
     context: Array<{ method: string }>;
     agent: Array<{ goal: string }>;
-    workflows: Array<{ flowId?: string; flowName?: string }>;
+    workflows: Array<{ flowId: string }>;
   } = { tool: [], notify: [], context: [], agent: [], workflows: [] };
 
   const toolsInvoke: ToolsInvokeFn = async (req) => {
@@ -245,10 +245,7 @@ describe("Engine end-to-end (G+H pieces)", () => {
     return { finalMessage: "ok", toolCalls: [], status: "completed" };
   };
   const workflowsStart: WorkflowsStartFn = async (req) => {
-    calls.workflows.push({
-      ...(req.flowId ? { flowId: req.flowId } : {}),
-      ...(req.flowName ? { flowName: req.flowName } : {}),
-    });
+    calls.workflows.push({ flowId: req.flowId });
     return { runId: "run_stub" };
   };
 
@@ -347,7 +344,7 @@ describe("Engine end-to-end (G+H pieces)", () => {
                     pieceName: PIECE_TRIGGER_NAME,
                     pieceVersion: PIECE_VERSION,
                     actionName: "run_workflow",
-                    input: { flowId: "flow_other", payload: {} },
+                    input: { flow: "flow_other", payload: {} },
                   },
                 },
               },

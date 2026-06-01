@@ -37,8 +37,18 @@ import type {
   PieceInputSchema,
   PieceInputType,
 } from "./piece-input";
+import { WORKFLOW_EVENT_TYPES } from "./event-types";
 
 export type { PieceInputField, PieceInputSchema, PieceInputType } from "./piece-input";
+
+/**
+ * Piece-name + trigger-name pair for jarvis-trigger:on_event. Hoisted so
+ * the dynamic-sample injector and the composer prompt agree on the key.
+ */
+export const JARVIS_ON_EVENT_TRIGGER = {
+  piece: "@jarvispieces/piece-jarvis-trigger",
+  trigger: "on_event",
+} as const;
 
 export interface PieceCatalogAction {
   name: string;
@@ -64,6 +74,37 @@ export interface PieceCatalogTrigger extends PieceCatalogAction {
    * during a round-trip.
    */
   sampleData?: unknown;
+  /**
+   * Output sample varies with a single input property. Some triggers
+   * have an envelope whose effective shape depends on a config value:
+   * jarvis-trigger `on_event` is the canonical case (the `payload`
+   * sub-object changes structure with the `eventType` prop). The picker
+   * and the composer prompt read this to surface the right shape per
+   * configured value instead of a single static example.
+   *
+   * `propName` is the input prop whose value selects a sample;
+   * `samples` maps each known value to the matching full output sample
+   * (envelope included, not just the variable part). Falls back to
+   * `sampleData` when the prop is unset or its value isn't in the map.
+   *
+   * KNOWN LIMITATIONS (worth knowing before extending):
+   *   - Single-prop conditional only. A trigger whose shape depends on
+   *     `(secret, eventName)` cannot be expressed with this field; the
+   *     shape would need to grow to `propNames: string[]` + a nested
+   *     `samples` table keyed on the JSON-stringified value tuple. Not
+   *     a refactor to do speculatively -- wait for a real case.
+   *   - One-level discrimination. The selector key is the raw input
+   *     value; no expression evaluation, no computed selectors. If a
+   *     piece needs "this shape when prop value matches a regex," it
+   *     doesn't belong here.
+   *   - String selector values only. Picker / composer compare with
+   *     `===` against `step.settings.input[propName]`; non-string
+   *     prop values fall through to `sampleData`.
+   */
+  dynamicSampleData?: {
+    propName: string;
+    samples: Record<string, unknown>;
+  };
 }
 
 /**
@@ -232,11 +273,45 @@ export function discoverPieces(rootDirs: string[]): {
  * cache-rebuild time -- the on-disk catalog cache absorbs the cost across
  * subsequent boots.
  */
+/**
+ * Catalog projection schema version. Mixed into the cache key so any
+ * daemon-side change to the projected `PieceCatalogEntry` shape (new
+ * fields, reshaped existing fields, anything that `metadataToCatalogEntry`
+ * starts emitting differently) invalidates every existing on-disk cache.
+ *
+ * Why this is necessary: the rest of the cache key only hashes the engine
+ * bundle + each piece's compiled `dist/src/index.js`. The projection layer
+ * itself is daemon code; editing it without bumping this constant would
+ * leave every upgraded install silently serving the OLD projected shape
+ * until something forced a piece rebuild.
+ *
+ * BUMP THIS when you change `metadataToCatalogEntry` in a way that adds,
+ * removes, renames, or reshapes any field the editor / composer consumes.
+ *
+ * History:
+ *   v1 -- initial projection.
+ *   v2 -- added `auth` to PieceCatalogEntry.
+ *   v3 -- added `dynamicSampleData` to PieceCatalogTrigger (envelope
+ *         resolution for jarvis-trigger:on_event).
+ *   v4 -- promoted jarvis-trigger:on_event's `eventType` input field
+ *         from free-text string to enum (options sourced from
+ *         WORKFLOW_EVENT_TYPES at projection time).
+ *   v5 -- added `group` to enum options (used by the editor's <select>
+ *         to render <optgroup> sections for the on_event eventType
+ *         dropdown).
+ *   v6 -- promoted jarvis-trigger:run_workflow's `flow` input from
+ *         `string` to `flow_ref`. Replaces the old flowId+flowName
+ *         pair on the piece source. Editor renders flow_ref as a
+ *         searchable workflow picker.
+ */
+export const CATALOG_SCHEMA_VERSION = "6";
+
 export function computeCatalogCacheKey(opts: {
   bundlePath: string;
   pieceRoots: string[];
 }): string {
   const h = createHash("sha256");
+  h.update(`schema\0${CATALOG_SCHEMA_VERSION}\0`);
   h.update("bundle\0");
   hashFileContents(h, opts.bundlePath);
   const { entries } = discoverPieces(opts.pieceRoots);
@@ -244,6 +319,26 @@ export function computeCatalogCacheKey(opts: {
     h.update(`piece\0${e.name}\0${e.version}\0`);
     hashFileContents(h, resolve(e.dir, "dist/src/index.js"));
   }
+  // Mix in the event-type registry so adding/removing an entry in
+  // `WORKFLOW_EVENT_TYPES` invalidates caches automatically. The
+  // jarvis-trigger:on_event projection synthesizes its
+  // `dynamicSampleData` from this registry, so a registry edit IS a
+  // projected-shape edit even though no piece source changed.
+  //
+  // Canonicalize by sorting on `type` before hashing so a reorder of
+  // the registry (e.g. alphabetizing the source file) doesn't bust
+  // the cache when the projected content didn't actually change. The
+  // projection itself iterates `WORKFLOW_EVENT_TYPES` in declared
+  // order, but that order is invisible to consumers (picker groups
+  // alphabetically inside its <optgroup>s; composer prompt just lists
+  // entries) so cache equivalence by content beats equivalence by
+  // declared order.
+  h.update("event-types\0");
+  h.update(
+    JSON.stringify(
+      [...WORKFLOW_EVENT_TYPES].sort((a, b) => a.type.localeCompare(b.type)),
+    ),
+  );
   return h.digest("hex");
 }
 
@@ -507,6 +602,13 @@ export function metadataToCatalogEntry(meta: RawPieceMetadata | unknown): PieceC
     }
     out.triggers = triggers;
   }
+  // Apply any Jarvis-specific catalog enrichments after the generic
+  // projection finishes. Today this covers two upgrades on the
+  // jarvis-trigger piece (on_event eventType -> enum, run_workflow
+  // flow -> flow_ref). Centralising the gating keeps the generic
+  // projection above piece-agnostic and gives the next "Jarvis tweak"
+  // a single named home.
+  enrichJarvisCatalogEntry(out);
   // Project piece.auth into the catalog's auth shape. We only forward
   // it when the upstream type is one of AppConnectionType's variants;
   // anything else (NO_AUTH, malformed) is treated as "no auth needed."
@@ -524,6 +626,116 @@ export function metadataToCatalogEntry(meta: RawPieceMetadata | unknown): PieceC
     }
   }
   return out;
+}
+
+/**
+ * Apply Jarvis-specific catalog enrichments AFTER the generic
+ * projection in `metadataToCatalogEntry`. Each enrichment is gated by
+ * piece identity and a defensive presence check on the target action /
+ * trigger, so an upstream rename (or a Jarvis-piece source edit that
+ * drops a sub-action) silently no-ops rather than crashing the catalog
+ * build.
+ *
+ * The set of enrichments here is small and well-known:
+ *   - jarvis-trigger:on_event   -- attach `dynamicSampleData` and
+ *                                  promote `eventType` to enum.
+ *   - jarvis-trigger:run_workflow -- promote `flow` to flow_ref.
+ *
+ * To add a new enrichment: add a guarded block here, document the
+ * (piece, target) pair, and bump CATALOG_SCHEMA_VERSION so existing
+ * on-disk caches re-project.
+ */
+export function enrichJarvisCatalogEntry(entry: PieceCatalogEntry): void {
+  if (entry.name !== JARVIS_ON_EVENT_TRIGGER.piece) return;
+  const onEvent = entry.triggers?.[JARVIS_ON_EVENT_TRIGGER.trigger];
+  if (onEvent) {
+    onEvent.dynamicSampleData = buildOnEventDynamicSampleData();
+    upgradeOnEventEventTypeFieldToEnum(onEvent);
+  }
+  const runWorkflow = entry.actions["run_workflow"];
+  if (runWorkflow) {
+    upgradeRunWorkflowFlowFieldToFlowRef(runWorkflow);
+  }
+}
+
+/**
+ * Build the `dynamicSampleData` map for jarvis-trigger:on_event. Each
+ * entry surfaces the full envelope the trigger emits when configured for
+ * that event type -- not just the payload -- so consumers (variable
+ * picker, composer prompt) get an output sample they can wire from
+ * verbatim without splicing the envelope themselves.
+ *
+ * Sourced from `WORKFLOW_EVENT_TYPES` so adding a new event type lights
+ * up everywhere automatically: add it to the registry, restart the
+ * daemon, the picker and the composer both see it.
+ */
+export function buildOnEventDynamicSampleData(): {
+  propName: string;
+  samples: Record<string, unknown>;
+} {
+  const samples: Record<string, unknown> = {};
+  for (const meta of WORKFLOW_EVENT_TYPES) {
+    samples[meta.type] = {
+      id: "evt_sample",
+      eventType: meta.type,
+      payload: meta.payloadExample ?? {},
+      timestamp: 0,
+    };
+  }
+  return { propName: "eventType", samples };
+}
+
+/**
+ * Rewrite the `eventType` input field on the on_event trigger from a
+ * free-text string into an enum populated from `WORKFLOW_EVENT_TYPES`.
+ * In-place so the surrounding projection treats the trigger entry
+ * normally.
+ *
+ * Resilient to schema drift: if the trigger has no `inputSchema`, no
+ * `fields` array, or no `eventType` field at all (which would mean the
+ * piece source was renamed without updating this projection), we leave
+ * the schema untouched and let the field stay free-text. Better to ship
+ * a slightly worse UX than to silently drop a required field.
+ */
+function upgradeOnEventEventTypeFieldToEnum(trigger: PieceCatalogTrigger): void {
+  const fields = trigger.inputSchema?.fields;
+  if (!fields) return;
+  const eventTypeField = fields.find((f) => f.name === "eventType");
+  if (!eventTypeField) return;
+  eventTypeField.type = "enum";
+  eventTypeField.options = WORKFLOW_EVENT_TYPES.map((meta) => ({
+    value: meta.type,
+    // Canonical id as the label too: the LLM composer and downstream
+    // pieces match on the exact string, so showing it verbatim avoids
+    // any user confusion about "what do I write here." The description
+    // is surfaced as a hover tooltip via the editor's <option title>.
+    label: meta.type,
+    description: meta.description,
+    // Group by the source segment of the canonical id
+    // (`observer.clipboard_changed` -> `observer`) so the editor's
+    // <select> can render <optgroup> headers and stay scannable as
+    // the registry grows.
+    group: meta.type.includes(".") ? meta.type.slice(0, meta.type.indexOf(".")) : undefined,
+  }));
+}
+
+/**
+ * Rewrite the `flow` input field on jarvis-trigger's `run_workflow`
+ * action from a plain string to `flow_ref`. The editor renders
+ * `flow_ref` as a searchable popover backed by `/api/workflows`, so the
+ * user picks from a list of their workflows by display name instead of
+ * having to remember and type a flow id.
+ *
+ * Same resilience as the on_event enum upgrade: no-op if the input
+ * schema or the `flow` field is missing (defensive against future
+ * piece-source renames).
+ */
+function upgradeRunWorkflowFlowFieldToFlowRef(action: PieceCatalogAction): void {
+  const fields = action.inputSchema?.fields;
+  if (!fields) return;
+  const flowField = fields.find((f) => f.name === "flow");
+  if (!flowField) return;
+  flowField.type = "flow_ref";
 }
 
 /**

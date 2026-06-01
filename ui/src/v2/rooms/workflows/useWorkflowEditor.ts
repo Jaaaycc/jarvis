@@ -15,6 +15,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ConnectionMeta } from "./useConnections";
 import {
+  detectTriggerKind,
+  makeEmptyStash,
+  transitionTriggerKind,
+  type TriggerKind,
+  type TriggerKindStash,
+} from "./trigger-kinds";
+import {
   addStepToHead as treeAddStepToHead,
   allReachableNames,
   applySchemaDefaults,
@@ -118,6 +125,13 @@ export interface FlowVersion {
   updated: number;
 }
 
+/**
+ * Mirror of the daemon-side `PieceInputType` declared in
+ * `src/workflows/runtime/piece-input.ts`. KEEP IN SYNC: the catalog
+ * API returns whatever the daemon emits, and the editor falls through
+ * to its default branch (a string-style input) for any unknown value.
+ * Adding a new variant means editing BOTH files.
+ */
 export type PieceInputType =
   | "string"
   | "long_text"
@@ -126,7 +140,8 @@ export type PieceInputType =
   | "enum"
   | "multi_enum"
   | "datetime"
-  | "json";
+  | "json"
+  | "flow_ref";
 
 export interface PieceInputField {
   name: string;
@@ -135,7 +150,7 @@ export interface PieceInputField {
   required: boolean;
   description?: string;
   placeholder?: string;
-  options?: Array<{ value: string; label: string; description?: string }>;
+  options?: Array<{ value: string; label: string; description?: string; group?: string }>;
   default?: unknown;
 }
 
@@ -157,6 +172,16 @@ export interface PieceCatalogActionOrTrigger {
    */
   outputSample?: unknown;
   sampleData?: unknown;
+  /**
+   * Output sample varies with a single input property. Used by triggers
+   * whose envelope shape depends on a config value (jarvis-trigger
+   * `on_event`: payload depends on `eventType`). Picker uses this when
+   * present to resolve the right sample for the step's current settings.
+   */
+  dynamicSampleData?: {
+    propName: string;
+    samples: Record<string, unknown>;
+  };
 }
 
 /**
@@ -222,10 +247,13 @@ export function useWorkflowEditor(flowId: string | null) {
   const [connections, setConnections] = useState<ConnectionMeta[]>([]);
   const ignoreNextLoadRef = useRef(false);
 
-  // Stash for trigger settings while the user is in EMPTY (manual) mode.
-  // Switching back to PIECE_TRIGGER restores the prior piece + input so a
-  // morph round-trip doesn't lose work.
-  const triggerSettingsStashRef = useRef<FlowStepNode["settings"] | null>(null);
+  // Per-kind stash of prior trigger settings. Switching kinds snapshots the
+  // outgoing kind's settings into this map; switching back to a kind whose
+  // stash is populated restores it verbatim. Closes the silent-discard
+  // hole the prior single-ref design had on direct kind-to-kind hops
+  // (schedule -> webhook would lose the cron). See
+  // `./trigger-kinds.ts:transitionTriggerKind` for the pure semantics.
+  const triggerSettingsStashRef = useRef<TriggerKindStash>(makeEmptyStash());
 
   /**
    * Bounded undo stack. Snapshots `{trigger, orphans, positions}` before
@@ -901,30 +929,37 @@ export function useWorkflowEditor(flowId: string | null) {
   );
 
   /**
-   * Morph the trigger between EMPTY (manual) and PIECE_TRIGGER. Switching to
-   * EMPTY stashes the prior settings; switching back restores them so the
-   * round-trip doesn't discard the user's piece + input.
+   * Four-way trigger kind selector. Each kind maps to a canonical
+   * (pieceName, triggerName) pair via `TRIGGER_KINDS`; the transition
+   * itself (including the per-kind stash that lets the user round-trip
+   * without losing config) lives in `./trigger-kinds.ts`.
+   *
+   *   manual   -> EMPTY trigger (POST /run only)
+   *   schedule -> built-in cron primitive
+   *   webhook  -> built-in HTTP primitive
+   *   event    -> @jarvispieces/piece-jarvis-trigger:on_event
+   *
+   * If the current trigger is a non-canonical PIECE_TRIGGER
+   * (community piece, imported flow, etc.), the picker still routes
+   * through `transitionTriggerKind` -- the OUTGOING kind is detected
+   * as `"other"` and its settings aren't stashed (we have no kind to
+   * key them under). The user explicitly clicked a button to switch,
+   * so this is opt-in clobbering, not a silent overwrite.
    */
-  const setTriggerType = useCallback((type: "EMPTY" | "PIECE_TRIGGER"): void => {
+  const setTriggerKind = useCallback((kind: TriggerKind): void => {
     setDraftTrigger((prev) => {
       if (!prev) return prev;
       const next = cloneTrigger(prev);
-      if (type === "EMPTY") {
-        // Stash anything non-trivial so we can restore on the way back.
-        if (next.settings && (next.settings.pieceName || Object.keys(next.settings.input ?? {}).length > 0)) {
-          triggerSettingsStashRef.current = JSON.parse(JSON.stringify(next.settings));
-        }
-        next.type = "EMPTY";
-        next.settings = {};
-      } else {
-        next.type = "PIECE_TRIGGER";
-        if (triggerSettingsStashRef.current) {
-          next.settings = JSON.parse(JSON.stringify(triggerSettingsStashRef.current));
-          triggerSettingsStashRef.current = null;
-        } else if (!next.settings || !next.settings.pieceName) {
-          next.settings = { input: {} };
-        }
-      }
+      const currentKind = detectTriggerKind(prev);
+      const { type, settings, nextStash } = transitionTriggerKind(
+        currentKind,
+        prev.settings,
+        kind,
+        triggerSettingsStashRef.current,
+      );
+      triggerSettingsStashRef.current = nextStash;
+      next.type = type;
+      next.settings = settings;
       return next;
     });
     setDirty(true);
@@ -1380,7 +1415,7 @@ export function useWorkflowEditor(flowId: string | null) {
     setStepPiece,
     setStepErrorHandling,
     addErrorHandling,
-    setTriggerType,
+    setTriggerKind,
     insertStepAfter,
     addStepToHead,
     deleteStep,

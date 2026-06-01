@@ -364,6 +364,10 @@ function buildSystemPrompt(catalog: string, toolsText: string, rolesText: string
     "    the branch evaluates backwards. To check whether a search/list returned results, prefer a step whose output is a real list and",
     "    use LIST_IS_NOT_EMPTY; if you only have a string, test its actual empty-wording with TEXT_CONTAINS.",
     "  - Use {{trigger.field}} and {{step_N.field}} templates to wire data between steps.",
+    "  - For jarvis-trigger:on_event, the trigger output is an event envelope shaped",
+    "    { id, eventType, payload, timestamp } -- the actual event data lives under `payload`.",
+    "    Reference payload fields as {{trigger.payload.<field>}}, NOT {{trigger.<field>}}.",
+    "    Example: clipboard text is {{trigger.payload.content}}; an email's subject is {{trigger.payload.subject}}.",
     "  - Field names in `{{step.field}}` MUST exist on that step's declared `output` (see each action / trigger in the catalog).",
     "    Do not guess fields from the user's wording -- for example, a piece whose output is `{ result: ... }` is referenced as",
     "    `{{step.result}}`, NOT `{{step.content}}` just because the user said 'content'. If a piece has no declared output, the",
@@ -458,6 +462,21 @@ function renderCatalog(registry: PieceLookup): string {
       // also set `outputSample` (Jarvis extension). Either is a valid
       // hint -- prefer sampleData when present.
       lines.push(...renderOutputLines((trigger as { sampleData?: unknown; outputSample?: unknown }).sampleData ?? (trigger as { outputSample?: unknown }).outputSample, 6));
+      // Dynamic-output triggers: emit a per-value sample block so the
+      // model sees the EXACT envelope it should wire from for each
+      // configured input value (rather than mentally splicing the
+      // generic `sampleData` envelope with a separate payload-example
+      // catalog). This is the future-proof channel -- adding a new
+      // event type to `WORKFLOW_EVENT_TYPES` lights up here too.
+      const dyn = (trigger as {
+        dynamicSampleData?: { propName: string; samples: Record<string, unknown> };
+      }).dynamicSampleData;
+      if (dyn && Object.keys(dyn.samples).length > 0) {
+        lines.push(`      output samples by ${dyn.propName} (the trigger's actual output for each value):`);
+        for (const [value, sample] of Object.entries(dyn.samples)) {
+          lines.push(`        ${value}: ${JSON.stringify(sample)}`);
+        }
+      }
     }
     for (const action of Object.values(piece.actions)) {
       lines.push(`    action  ${action.name}: ${action.description}`);
@@ -475,6 +494,7 @@ function renderCatalog(registry: PieceLookup): string {
   // Workflow event-type catalog (used by jarvis-trigger:on_event flows).
   lines.push("");
   lines.push("Available event types for jarvis-trigger:on_event (settings.input.eventType):");
+  lines.push("  Each event's payload fields below are accessed from downstream steps via {{trigger.payload.<field>}} (the trigger wraps the payload in an envelope -- see the wiring rules above).");
   for (const meta of WORKFLOW_EVENT_TYPES) {
     lines.push(`- ${meta.type}: ${meta.description}`);
     if (meta.payloadExample) {
@@ -547,6 +567,14 @@ function formatField(f: PieceInputField): string {
   const parts: string[] = [`${f.type}${f.required ? ", REQUIRED" : ""}`];
   if (f.options && f.options.length > 0) {
     parts.push(`options=${f.options.map((o) => o.value).join("|")}`);
+  }
+  if (f.type === "flow_ref") {
+    // The composer has no way to know which workflows exist on the
+    // user's machine -- any flow id the LLM invents will fail at
+    // run time. Tell it to emit an empty string for this field so
+    // the user picks the target via the editor's flow picker after
+    // the flow is composed.
+    parts.push('emit an empty string ""; user picks the target workflow via the editor');
   }
   if (f.description) parts.push(f.description);
   return `${parts.join("; ")}`;
@@ -774,6 +802,12 @@ function validateStep(
   if (schema) {
     for (const field of schema.fields) {
       if (!field.required) continue;
+      // `flow_ref` is required at run time but cannot be filled at
+      // compose time: the LLM has no list of valid flow ids on the
+      // user's machine. The editor's flow picker fills it after the
+      // flow is composed. Exempt from this check so the LLM doesn't
+      // hallucinate an id just to satisfy validation.
+      if (field.type === "flow_ref") continue;
       const v = input[field.name];
       const empty = v === undefined || v === null || v === "" || (Array.isArray(v) && v.length === 0);
       if (empty) {

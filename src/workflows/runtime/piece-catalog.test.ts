@@ -88,6 +88,153 @@ describe("PieceCatalog (unit)", () => {
     expect(entry.triggers?.["on_event"]?.displayName).toBe("On");
   });
 
+  test("metadataToCatalogEntry attaches dynamicSampleData to jarvis-trigger:on_event", () => {
+    // jarvis-trigger's on_event surfaces an envelope whose payload shape
+    // varies with the configured eventType. The projection injects a
+    // synthesized `dynamicSampleData` map sourced from the canonical
+    // `WORKFLOW_EVENT_TYPES` registry so the picker + composer don't
+    // each have to import the registry directly.
+    const entry = metadataToCatalogEntry({
+      name: "@jarvispieces/piece-jarvis-trigger",
+      displayName: "Jarvis: Trigger",
+      description: "",
+      actions: {},
+      triggers: {
+        on_event: { name: "on_event", displayName: "On event", description: "", props: {} },
+      },
+    });
+    const onEvent = entry.triggers?.["on_event"];
+    expect(onEvent?.dynamicSampleData?.propName).toBe("eventType");
+    const samples = onEvent?.dynamicSampleData?.samples ?? {};
+    // Spot-check a representative event: the envelope is full (id +
+    // eventType + payload + timestamp), and the payload mirrors the
+    // registry's payloadExample.
+    const clip = samples["observer.clipboard_changed"] as
+      | { eventType?: string; payload?: { content?: string; length?: number }; timestamp?: number; id?: string }
+      | undefined;
+    expect(clip?.eventType).toBe("observer.clipboard_changed");
+    expect(clip?.payload?.content).toBe("https://example.com");
+    expect(clip?.payload?.length).toBe(19);
+    expect(typeof clip?.timestamp).toBe("number");
+    expect(typeof clip?.id).toBe("string");
+  });
+
+  test("metadataToCatalogEntry promotes on_event's eventType field to an enum populated from WORKFLOW_EVENT_TYPES", async () => {
+    // The piece source declares `eventType` as ShortText because the
+    // option list lives daemon-side, not in the piece bundle. The
+    // projection upgrades it so the editor renders a real dropdown
+    // (the `enum` widget). Options come from the canonical registry;
+    // each option's `description` is the per-event prose used as the
+    // <option title> hover.
+    const entry = metadataToCatalogEntry({
+      name: "@jarvispieces/piece-jarvis-trigger",
+      displayName: "Jarvis: Trigger",
+      description: "",
+      actions: {},
+      triggers: {
+        on_event: {
+          name: "on_event",
+          displayName: "On event",
+          description: "",
+          // Mirrors how the engine sends it: required free-text string.
+          props: {
+            eventType: { type: "SHORT_TEXT", required: true, displayName: "Event type" },
+            filter: { type: "JSON", required: false, displayName: "Filter" },
+          },
+        },
+      },
+    });
+    const eventTypeField = entry.triggers?.["on_event"]?.inputSchema?.fields.find(
+      (f) => f.name === "eventType",
+    );
+    expect(eventTypeField?.type).toBe("enum");
+    const optionValues = eventTypeField?.options?.map((o) => o.value) ?? [];
+    // Spot-check a few representative entries; full registry parity is
+    // implicit because the option set is built directly from it.
+    expect(optionValues).toContain("observer.clipboard_changed");
+    expect(optionValues).toContain("observer.email_received");
+    expect(optionValues).toContain("awareness.context_changed");
+    expect(optionValues).toContain("commitment.due_soon");
+    const { WORKFLOW_EVENT_TYPES } = await import("../runtime/event-types");
+    expect(optionValues.length).toBe(WORKFLOW_EVENT_TYPES.length);
+    const clipboardOption = eventTypeField?.options?.find((o) => o.value === "observer.clipboard_changed");
+    expect(clipboardOption?.description).toMatch(/clipboard/i);
+    // Group field is the source segment of the canonical id so the
+    // editor can render <optgroup>s. Every event-type id is dotted,
+    // so every option carries a group.
+    expect(clipboardOption?.group).toBe("observer");
+    const commitmentOption = eventTypeField?.options?.find((o) => o.value === "commitment.due_soon");
+    expect(commitmentOption?.group).toBe("commitment");
+    expect((eventTypeField?.options ?? []).every((o) => typeof o.group === "string" && o.group.length > 0)).toBe(true);
+    // Unrelated field is untouched -- the upgrade is surgical.
+    const filterField = entry.triggers?.["on_event"]?.inputSchema?.fields.find((f) => f.name === "filter");
+    expect(filterField?.type).toBe("json");
+  });
+
+  test("metadataToCatalogEntry promotes run_workflow's `flow` field to flow_ref", () => {
+    // The piece source declares `flow` as ShortText because the upstream
+    // framework has no flow-ref concept. The projection upgrades it so
+    // the editor renders a searchable workflow picker.
+    const entry = metadataToCatalogEntry({
+      name: "@jarvispieces/piece-jarvis-trigger",
+      displayName: "Jarvis: Trigger",
+      description: "",
+      actions: {
+        run_workflow: {
+          name: "run_workflow",
+          displayName: "Run another workflow",
+          description: "",
+          props: {
+            flow: { type: "SHORT_TEXT", required: true, displayName: "Flow" },
+            payload: { type: "JSON", required: false, displayName: "Payload" },
+          },
+        },
+      },
+      triggers: {},
+    });
+    const flowField = entry.actions["run_workflow"]?.inputSchema?.fields.find((f) => f.name === "flow");
+    expect(flowField?.type).toBe("flow_ref");
+    // Adjacent field is untouched -- the upgrade is surgical.
+    const payloadField = entry.actions["run_workflow"]?.inputSchema?.fields.find((f) => f.name === "payload");
+    expect(payloadField?.type).toBe("json");
+  });
+
+  test("metadataToCatalogEntry does NOT promote `flow` fields on unrelated pieces", () => {
+    // A piece that happens to name a string field "flow" should NOT
+    // be promoted to flow_ref. The promotion is keyed on the
+    // (piece, action) pair, not on field name alone.
+    const entry = metadataToCatalogEntry({
+      name: "@some/other-piece",
+      displayName: "Other",
+      description: "",
+      actions: {
+        run_workflow: {
+          name: "run_workflow",
+          displayName: "Run",
+          description: "",
+          props: {
+            flow: { type: "SHORT_TEXT", required: true, displayName: "Flow" },
+          },
+        },
+      },
+      triggers: {},
+    });
+    expect(entry.actions["run_workflow"]?.inputSchema?.fields[0]?.type).toBe("string");
+  });
+
+  test("metadataToCatalogEntry does NOT attach dynamicSampleData to unrelated pieces", () => {
+    const entry = metadataToCatalogEntry({
+      name: "@some/other-piece",
+      displayName: "Other",
+      description: "",
+      actions: {},
+      triggers: {
+        on_event: { name: "on_event", displayName: "On event", description: "", props: {} },
+      },
+    });
+    expect(entry.triggers?.["on_event"]?.dynamicSampleData).toBeUndefined();
+  });
+
   test("propsToInputSchema maps every supported PropertyType", () => {
     const schema = propsToInputSchema({
       a_short: { type: "SHORT_TEXT", required: true, displayName: "A" },

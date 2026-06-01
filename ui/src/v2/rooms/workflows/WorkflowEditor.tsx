@@ -44,6 +44,9 @@ import {
 } from "./useWorkflowEditor";
 import { flattenSteps, pathToStep } from "./tree";
 import { buildVariableRows, type VariableRow } from "./variable-rows";
+import { TRIGGER_KINDS, detectTriggerKind } from "./trigger-kinds";
+import { fetchFlowsForPicker, type FlowPickerEntry } from "./flow-picker-data";
+import { useListNav } from "./use-list-nav";
 import { useLibrary, type LibraryEntry as InstallableLibraryEntry } from "./useLibrary";
 import type { ConnectionMeta } from "./useConnections";
 import { useFlowRuns } from "./useFlowRuns";
@@ -621,6 +624,7 @@ export function WorkflowEditor({ flowId, onClose }: WorkflowEditorProps): React.
   );
 
   return (
+    <CurrentFlowIdContext.Provider value={flowId}>
     <div className="wf-editor" role="dialog" aria-modal="true" aria-labelledby="wf-editor-title">
       <header className="wf-editor__header">
         <div className="wf-editor__title">
@@ -982,7 +986,7 @@ export function WorkflowEditor({ flowId, onClose }: WorkflowEditorProps): React.
             containerKind={selectedFlat?.containerKind}
             catalog={editor.catalog}
             connections={editor.connections}
-            onSetTriggerType={(type) => editor.setTriggerType(type)}
+            onSetTriggerKind={(kind) => editor.setTriggerKind(kind)}
             onSetErrorHandling={(patch) => editor.setStepErrorHandling(selectedStep.name, patch)}
             onSetInput={(key, value) => editor.updateStepInput(selectedStep.name, key, value)}
             onAddInputKey={(key) => editor.updateStepInput(selectedStep.name, key, "")}
@@ -1053,8 +1057,18 @@ export function WorkflowEditor({ flowId, onClose }: WorkflowEditorProps): React.
         />
       ) : null}
     </div>
+    </CurrentFlowIdContext.Provider>
   );
 }
+
+/**
+ * The id of the workflow currently being edited. Provided at the top
+ * of `WorkflowEditor` and consumed by `FlowRefField` so the workflow
+ * picker can filter out the current flow (prevents a one-click
+ * self-recursion footgun in `run_workflow`). Defaults to `null` so
+ * unit-rendered field components outside the editor still mount.
+ */
+const CurrentFlowIdContext = createContext<string | null>(null);
 
 /* =========================================================== editable title */
 
@@ -1406,9 +1420,15 @@ function NodeSettingsPopover({
       // disambiguate via globalThis.
       const target = e.target as globalThis.Node;
       if (ref.current.contains(target)) return;
-      // Clicks inside the picker shouldn't close the settings popover.
-      const pickerEl = document.querySelector(".wf-var-picker");
-      if (pickerEl && pickerEl.contains(target)) return;
+      // Clicks inside any of our portal-rendered popovers shouldn't
+      // close the settings panel -- they belong to widgets the user
+      // opened from the panel (variable picker for templated inputs;
+      // flow_ref picker for `run_workflow.flow`). Add new portals to
+      // this allowlist so they don't accidentally dismiss the panel.
+      for (const sel of [".wf-var-picker", ".wf-flow-ref__popover"]) {
+        const el = document.querySelector(sel);
+        if (el && el.contains(target)) return;
+      }
       onClose();
     };
     const timer = window.setTimeout(() => {
@@ -2356,7 +2376,6 @@ function PieceLibraryPopover({
   const inputRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState<LibraryCategory>("all");
-  const [activeIdx, setActiveIdx] = useState(0);
   const [pos, setPos] = useState<{ left: number; top: number }>({ left: anchor.x, top: anchor.y });
 
   // Build the unified entry list. Three layers in display order:
@@ -2439,32 +2458,24 @@ function PieceLibraryPopover({
     };
   }, [onClose, installingId]);
 
-  // Keyboard nav: handled via a keydown attached to the popover so it
-  // doesn't fight with the global Esc-closes-editor handler. Enter and
-  // Esc are no-ops while an install is in flight -- same reasoning as the
-  // outside-click guard above.
-  const onKeyDown = useCallback(
-    (e: React.KeyboardEvent): void => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        if (!installingId) onClose();
-        return;
-      }
-      if (e.key === "ArrowDown") {
-        e.preventDefault();
-        setActiveIdx((i) => Math.min(rows.length - 1, i + 1));
-      } else if (e.key === "ArrowUp") {
-        e.preventDefault();
-        setActiveIdx((i) => Math.max(0, i - 1));
-      } else if (e.key === "Enter") {
-        e.preventDefault();
-        if (installingId) return;
-        const row = rows[activeIdx];
-        if (row) onPick(row);
-      }
+  // Keyboard nav via the shared hook. Enter and Esc are no-ops while
+  // an install is in flight -- same reasoning as the outside-click
+  // guard above (closing mid-install would break the install->reload
+  // ->place handoff). The hook itself doesn't know about install
+  // state, so we guard inside the wrapped callbacks.
+  const {
+    activeIdx,
+    setActiveIdx,
+    onKeyDown,
+  } = useListNav<LibraryEntry>({
+    items: rows,
+    onSelect: (row) => {
+      if (!installingId) onPick(row);
     },
-    [rows, activeIdx, onPick, onClose, installingId],
-  );
+    onClose: () => {
+      if (!installingId) onClose();
+    },
+  });
 
   return createPortal(
     <div
@@ -3165,7 +3176,7 @@ interface PropertiesPanelProps {
   sampleInput: unknown | undefined;
   /** True when the loaded version is LOCKED -- disables sample-data editing + test. */
   isLocked: boolean;
-  onSetTriggerType: (type: "EMPTY" | "PIECE_TRIGGER") => void;
+  onSetTriggerKind: (kind: "manual" | "schedule" | "webhook" | "event") => void;
   onSetErrorHandling: (patch: { continueOnFailure?: boolean; retryOnFailure?: boolean }) => void;
   onSetInput: (key: string, value: unknown) => void;
   onAddInputKey: (key: string) => void;
@@ -3197,7 +3208,7 @@ function PropertiesPanel(props: PropertiesPanelProps): React.ReactElement {
     isTopLevel,
     catalog,
     connections,
-    onSetTriggerType,
+    onSetTriggerKind,
     onSetErrorHandling,
     onSetInput,
     onAddInputKey,
@@ -3218,6 +3229,9 @@ function PropertiesPanel(props: PropertiesPanelProps): React.ReactElement {
   const isLoop = step.type === "LOOP_ON_ITEMS";
   const isRouter = step.type === "ROUTER";
   const piece = catalog.find((p) => p.name === step.settings?.pieceName);
+  // Detect once per render; consumed by the 4-way picker (to pick the
+  // active button) and by the "other" hint below it.
+  const detectedTriggerKind = isTriggerStep ? detectTriggerKind(step) : "manual";
   // Look up the selected sub-action's metadata so the typed-input widgets
   // below have a schema to render against. We keep this lookup even
   // though the user can no longer pick a different sub-action from the
@@ -3255,34 +3269,48 @@ function PropertiesPanel(props: PropertiesPanelProps): React.ReactElement {
           looking. */}
 
       {isTriggerStep ? (
-        <Field label="Trigger mode">
+        <Field label="Trigger">
           <div className="wf-props__segmented" role="radiogroup">
-            <button
-              type="button"
-              role="radio"
-              aria-checked={step.type === "EMPTY"}
-              className={`wf-props__seg ${step.type === "EMPTY" ? "wf-props__seg--on" : ""}`}
-              onClick={() => onSetTriggerType("EMPTY")}
-            >
-              Manual
-            </button>
-            <button
-              type="button"
-              role="radio"
-              aria-checked={step.type === "PIECE_TRIGGER"}
-              className={`wf-props__seg ${step.type === "PIECE_TRIGGER" ? "wf-props__seg--on" : ""}`}
-              onClick={() => onSetTriggerType("PIECE_TRIGGER")}
-            >
-              Schedule / webhook / event
-            </button>
+            {TRIGGER_KINDS.map((tk) => {
+              // When the step is a non-canonical PIECE_TRIGGER (community
+              // piece, imported flow, ...) detection returns "other" and
+              // NO button is marked active. The user has to explicitly
+              // click a kind to replace it, instead of the panel silently
+              // implying Manual was the current state.
+              const active = tk.kind === detectedTriggerKind;
+              return (
+                <button
+                  key={tk.kind}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  className={`wf-props__seg ${active ? "wf-props__seg--on" : ""}`}
+                  onClick={() => onSetTriggerKind(tk.kind)}
+                  title={tk.description}
+                >
+                  {tk.label}
+                </button>
+              );
+            })}
           </div>
         </Field>
       ) : null}
 
       {isManual ? (
         <p className="wf-props__hint">
-          Manual triggers fire only when you POST to <code>/api/workflows/:id/run</code>. Switch to
-          "Schedule / webhook / event" above to fire automatically.
+          Manual triggers fire only when you POST to <code>/api/workflows/:id/run</code>. Pick
+          Schedule, Webhook, or Event above to fire automatically.
+        </p>
+      ) : null}
+
+      {detectedTriggerKind === "other" ? (
+        <p className="wf-props__hint">
+          This trigger uses a custom piece
+          {step.settings?.pieceName ? (
+            <> (<code>{step.settings.pieceName}</code>)</>
+          ) : null}
+          . Pick one of the kinds above to replace it. The current piece configuration will be
+          discarded when you switch -- there's no way to bring it back from here.
         </p>
       ) : null}
 
@@ -4038,6 +4066,29 @@ function TypedField({ field, value, onChange }: TypedFieldProps): React.ReactEle
   }
 
   if (field.type === "enum") {
+    // Group options by their `group` attribute (when any option carries
+    // one) so wide dropdowns -- jarvis-trigger:on_event eventType is
+    // the canonical case -- render as <optgroup> sections rather than
+    // a flat 15+ item list. Order: groups appear in first-seen order,
+    // ungrouped options first. Falls back to a flat list when no
+    // option declares a group.
+    const opts = field.options ?? [];
+    const hasGroups = opts.some((o) => typeof o.group === "string" && o.group.length > 0);
+    const groupOrder: string[] = [];
+    const grouped = new Map<string, typeof opts>();
+    const ungrouped: typeof opts = [];
+    for (const o of opts) {
+      const g = typeof o.group === "string" && o.group.length > 0 ? o.group : null;
+      if (g === null) {
+        ungrouped.push(o);
+        continue;
+      }
+      if (!grouped.has(g)) {
+        groupOrder.push(g);
+        grouped.set(g, []);
+      }
+      (grouped.get(g) as typeof opts).push(o);
+    }
     return (
       <label className={`wf-props__field ${isMissing ? "wf-props__field--missing" : ""}`}>
         {labelEl}
@@ -4046,11 +4097,40 @@ function TypedField({ field, value, onChange }: TypedFieldProps): React.ReactEle
           onChange={(e) => onChange(e.target.value || undefined)}
         >
           <option value="">{field.required ? "— select —" : "— none —"}</option>
-          {(field.options ?? []).map((o) => (
-            <option key={o.value} value={o.value} title={o.description}>
-              {o.label}
-            </option>
-          ))}
+          {hasGroups ? (
+            <>
+              {groupOrder.map((g) => (
+                <optgroup key={g} label={g}>
+                  {(grouped.get(g) ?? []).map((o) => (
+                    <option key={o.value} value={o.value} title={o.description}>
+                      {o.label}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+              {/* Stragglers without a group land in a synthetic "Other"
+                  group so they're still labelled rather than floating
+                  unlabelled at the top of the dropdown. Today's only
+                  consumer (on_event eventType) has no ungrouped
+                  options, but this keeps the renderer robust if a
+                  future field ships a partial group set. */}
+              {ungrouped.length > 0 ? (
+                <optgroup label="Other">
+                  {ungrouped.map((o) => (
+                    <option key={o.value} value={o.value} title={o.description}>
+                      {o.label}
+                    </option>
+                  ))}
+                </optgroup>
+              ) : null}
+            </>
+          ) : (
+            opts.map((o) => (
+              <option key={o.value} value={o.value} title={o.description}>
+                {o.label}
+              </option>
+            ))
+          )}
         </select>
         {field.description ? <span className="wf-props__field-help">{field.description}</span> : null}
       </label>
@@ -4113,6 +4193,10 @@ function TypedField({ field, value, onChange }: TypedFieldProps): React.ReactEle
     );
   }
 
+  if (field.type === "flow_ref") {
+    return <FlowRefField field={field} value={value} onChange={onChange} labelEl={labelEl} isMissing={isMissing} />;
+  }
+
   // default: string
   return <StringField field={field} value={value} onChange={onChange} labelEl={labelEl} isMissing={isMissing} />;
 }
@@ -4149,6 +4233,323 @@ function StringField({
       />
       {field.description ? <span className="wf-props__field-help">{field.description}</span> : null}
     </label>
+  );
+}
+
+/**
+ * Workflow picker. Stores a flow id as the field value; renders a
+ * trigger button labelled with the resolved flow's displayName.
+ * Clicking the button opens a popover with a search box + filtered
+ * list of all workflows. Lazy fetch on first open so a panel that
+ * never shows a flow_ref field never hits `/api/workflows`.
+ *
+ * Why custom rather than a plain <select> with options pulled at
+ * catalog projection time: the workflow list is per-user state,
+ * potentially long, and changes outside the catalog's invalidation
+ * lifecycle (a user adds a workflow without restarting the daemon
+ * or rebuilding the catalog). Fetching on demand keeps the picker
+ * always-fresh and the catalog projection minimal.
+ */
+function FlowRefField({
+  field,
+  value,
+  onChange,
+  labelEl,
+  isMissing,
+}: {
+  field: PieceInputField;
+  value: unknown;
+  onChange: (next: unknown) => void;
+  labelEl: React.ReactNode;
+  isMissing: boolean;
+}): React.ReactElement {
+  const flowId = typeof value === "string" ? value : "";
+  // Filter the current workflow out of the list: picking yourself
+  // would recurse (the daemon also guards against this at
+  // workflows.start, but the UI should not even offer the option).
+  const currentWorkflowId = useContext(CurrentFlowIdContext);
+  const [open, setOpen] = useState(false);
+  const [flows, setFlows] = useState<FlowPickerEntry[]>([]);
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  // Ref to the rendered popover element. Replaces a previous
+  // `document.querySelector(".wf-flow-ref__popover")` lookup that
+  // would pick the FIRST flow_ref popover in the document -- not
+  // necessarily this picker's. Today only one flow_ref field ships
+  // (run_workflow.flow) but the renderer is generic so we scope the
+  // outside-click test to the local ref.
+  const popoverRef = useRef<HTMLDivElement | null>(null);
+
+  // Fetch the flow list on mount AND on every popover open. The
+  // mount-fetch lets the button label resolve `flowId` to a
+  // displayName without the user having to open the popover first
+  // (matters when the panel reopens with a flow already picked).
+  // The per-open refresh keeps the list current if the user added a
+  // workflow since this component mounted. Cheap GET -- typical
+  // response is well under 100KB even for power users.
+  useEffect(() => {
+    let cancelled = false;
+    // Only show the loading skeleton when there's nothing to show
+    // already; otherwise the user sees a flash of "Loading..." over
+    // the cached list every time they open the picker.
+    setLoading((prev) => (flows.length === 0 ? true : prev));
+    setError(null);
+    (async (): Promise<void> => {
+      try {
+        const list = await fetchFlowsForPicker();
+        if (!cancelled) setFlows(list);
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // Refetch when the popover opens; the mount-only run also fires
+    // because `open` defaults to false at mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  // Reset transient picker state when the popover closes: clear the
+  // search box / error so the next reopen starts fresh. Keep `flows`
+  // cached: the button label below resolves the current value's
+  // displayName against this list, so wiping it on close would make
+  // the closed-state button read "(unknown flow: <id>)" until the
+  // popover is opened again. The next open re-fetches and replaces.
+  // `activeIdx` is managed by `useListNav` below; the hook clamps it
+  // on filter changes automatically.
+  useEffect(() => {
+    if (open) return;
+    setQuery("");
+    setError(null);
+  }, [open]);
+
+  // Resolve the current value to a displayName for the button label.
+  // Falls back to the raw id (or a placeholder) so the user can still
+  // see what's stored when the flow list hasn't loaded yet.
+  const selected = flows.find((f) => f.id === flowId);
+  const buttonLabel = selected
+    ? selected.displayName || selected.id
+    : flowId
+      ? `(unknown flow: ${flowId})`
+      : "Pick a workflow";
+
+  // Filter on display name (case-insensitive substring) so a user
+  // typing "morning" matches "Morning briefing" without exact case.
+  // Drop the current workflow up front so it never appears as a
+  // self-recursion option.
+  const filtered = useMemo(
+    () =>
+      flows
+        .filter((f) => f.id !== currentWorkflowId)
+        .filter((f) => f.displayName.toLowerCase().includes(query.toLowerCase())),
+    [flows, currentWorkflowId, query],
+  );
+
+  // Shared keyboard navigation (Arrow / Enter / Escape). The hook
+  // owns activeIdx clamping on filter changes and the
+  // stopPropagation-on-Escape contract every popover in the editor
+  // needs to keep the outer Esc handler from also firing.
+  const { activeIdx, setActiveIdx, onKeyDown: onListKeyDown } = useListNav({
+    items: filtered,
+    onSelect: (pick) => {
+      onChange(pick.id);
+      setOpen(false);
+    },
+    onClose: () => setOpen(false),
+  });
+
+  // Focus the search box when the popover opens for keyboard users.
+  useEffect(() => {
+    if (open) inputRef.current?.focus();
+  }, [open]);
+
+  // Escape + outside-click. Escape calls stopPropagation so the
+  // editor's outer Escape handler (which prompts about unsaved work)
+  // doesn't fire when the user is just dismissing the popover.
+  useEffect(() => {
+    if (!open) return;
+    function onKey(e: KeyboardEvent): void {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        setOpen(false);
+      }
+    }
+    function onClick(e: MouseEvent): void {
+      if (!(e.target instanceof Node)) return;
+      const t = e.target;
+      if (btnRef.current?.contains(t)) return;
+      if (popoverRef.current?.contains(t)) return;
+      setOpen(false);
+    }
+    document.addEventListener("keydown", onKey, true);
+    document.addEventListener("mousedown", onClick);
+    return () => {
+      document.removeEventListener("keydown", onKey, true);
+      document.removeEventListener("mousedown", onClick);
+    };
+  }, [open]);
+
+  return (
+    <div className={`wf-props__field wf-flow-ref ${isMissing ? "wf-props__field--missing" : ""}`}>
+      {labelEl}
+      <button
+        ref={btnRef}
+        type="button"
+        className="wf-flow-ref__trigger"
+        onClick={() => setOpen((v) => !v)}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+      >
+        <span className="wf-flow-ref__trigger-label">{buttonLabel}</span>
+        <span className="wf-flow-ref__trigger-caret">▾</span>
+      </button>
+      {open
+        ? createPortal(
+            <FlowRefPopover
+              popoverRef={popoverRef}
+              anchorEl={btnRef.current}
+              inputRef={inputRef}
+              query={query}
+              setQuery={setQuery}
+              filtered={filtered}
+              activeIdx={activeIdx}
+              setActiveIdx={setActiveIdx}
+              onKeyDown={onListKeyDown}
+              loading={loading}
+              error={error}
+              currentId={flowId}
+              onPick={(id) => {
+                onChange(id);
+                setOpen(false);
+              }}
+              onClear={() => {
+                onChange(undefined);
+                setOpen(false);
+              }}
+            />,
+            document.body,
+          )
+        : null}
+      {field.description ? <span className="wf-props__field-help">{field.description}</span> : null}
+    </div>
+  );
+}
+
+interface FlowRefPopoverProps {
+  popoverRef: React.RefObject<HTMLDivElement | null>;
+  anchorEl: HTMLButtonElement | null;
+  inputRef: React.RefObject<HTMLInputElement | null>;
+  query: string;
+  setQuery: (v: string) => void;
+  filtered: FlowPickerEntry[];
+  activeIdx: number;
+  setActiveIdx: (i: number) => void;
+  onKeyDown: (e: React.KeyboardEvent<HTMLElement>) => void;
+  loading: boolean;
+  error: string | null;
+  currentId: string;
+  onPick: (id: string) => void;
+  onClear: () => void;
+}
+
+function FlowRefPopover({
+  popoverRef,
+  anchorEl,
+  inputRef,
+  query,
+  setQuery,
+  filtered,
+  activeIdx,
+  setActiveIdx,
+  onKeyDown,
+  loading,
+  error,
+  currentId,
+  onPick,
+  onClear,
+}: FlowRefPopoverProps): React.ReactElement {
+  const [pos, setPos] = useState<{ left: number; top: number; width: number }>({ left: 0, top: 0, width: 240 });
+  useLayoutEffect(() => {
+    if (!anchorEl) return;
+    const r = anchorEl.getBoundingClientRect();
+    // Align the popover's left edge to the button and place it
+    // directly below; clamp into the viewport so it never spills off
+    // the right side or bottom.
+    const width = Math.max(r.width, 240);
+    let left = r.left;
+    if (left + width + 8 > window.innerWidth) left = Math.max(8, window.innerWidth - width - 8);
+    let top = r.bottom + 4;
+    const maxH = 320;
+    if (top + maxH + 8 > window.innerHeight) {
+      // Open upward when there's no room below.
+      top = Math.max(8, r.top - maxH - 4);
+    }
+    setPos({ left, top, width });
+  }, [anchorEl]);
+
+  return (
+    <div
+      ref={popoverRef}
+      className="wf-flow-ref__popover"
+      style={{ left: pos.left, top: pos.top, width: pos.width }}
+      role="dialog"
+      onKeyDown={onKeyDown}
+    >
+      <input
+        ref={inputRef}
+        type="text"
+        className="wf-flow-ref__search"
+        placeholder="Search workflows..."
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+      />
+      {error ? (
+        <p className="wf-flow-ref__hint wf-flow-ref__hint--error">Couldn't load workflows: {error}</p>
+      ) : loading ? (
+        <p className="wf-flow-ref__hint">Loading workflows...</p>
+      ) : filtered.length === 0 ? (
+        <p className="wf-flow-ref__hint">
+          {query ? "No workflows match." : "No other workflows yet. Create one first, then come back here."}
+        </p>
+      ) : (
+        <ul className="wf-flow-ref__list" role="listbox">
+          {filtered.map((f, i) => {
+            const active = i === activeIdx;
+            return (
+              <li key={f.id}>
+                <button
+                  type="button"
+                  className={`wf-flow-ref__row ${f.id === currentId ? "wf-flow-ref__row--on" : ""} ${active ? "wf-flow-ref__row--active" : ""}`}
+                  onClick={() => onPick(f.id)}
+                  onMouseEnter={() => setActiveIdx(i)}
+                  role="option"
+                  aria-selected={f.id === currentId}
+                  title={f.id}
+                >
+                  <span className="wf-flow-ref__row-name">{f.displayName || "(no name)"}</span>
+                  <span className="wf-flow-ref__row-id">{f.id.slice(0, 8)}</span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {currentId ? (
+        <button
+          type="button"
+          className="wf-flow-ref__clear"
+          onClick={onClear}
+        >
+          Clear selection
+        </button>
+      ) : null}
+    </div>
   );
 }
 
