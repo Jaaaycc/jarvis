@@ -1,0 +1,82 @@
+# J.A.R.V.I.S. Configuration Template
+# ─────────────────────────────────────────────────────────────────
+# 1. Copy this file to config.yaml (same folder as docker-compose.yml)
+# 2. Replace every YOUR_*_HERE placeholder with your real values
+# 3. docker compose up -d
+# ─────────────────────────────────────────────────────────────────
+# NOTE: API keys can also be passed as env vars in .env
+#       Env vars always win over values in this file.
+# ─────────────────────────────────────────────────────────────────
+
+daemon:
+  port: 3142
+  data_dir: "/data"
+  db_path: "/data/jarvis.db"
+
+# ── LLM Providers ────────────────────────────────────────────────
+llm:
+  primary: "anthropic"
+  fallback:
+    - "openai"       # optional — remove if you don't have OpenAI key
+
+  # Anthropic Claude — PRIMARY (recommended)
+  anthropic:
+    api_key: "sk-ant-YOUR_ANTHROPIC_KEY_HERE"
+    model: "claude-sonnet-4-6"
+
+  # OpenAI — FALLBACK (optional, delete block if not needed)
+  # openai:
+  #   api_key: "sk-YOUR_OPENAI_KEY_HERE"
+  #   model: "gpt-4o"
+
+# ── Personality ───────────────────────────────────────────────────
+personality:
+  assistant_name: "Jarvis"
+  core_traits:
+    - "loyal"
+    - "efficient"
+    - "proactive"
+    - "respectful"
+    - "adaptive"
+
+# ── Authority ─────────────────────────────────────────────────────
+authority:
+  default_level: 3          # 0=ask everything  3=standard  5=full control
+  governed_categories:
+    - "send_email"
+    - "send_message"
+    - "make_payment"
+  overrides: []
+  context_rules: []
+  learning:
+    enabled: true
+    suggest_threshold: 5
+  emergency_state: "normal"
+
+# ── Heartbeat ─────────────────────────────────────────────────────
+heartbeat:
+  interval_minutes: 15
+  active_hours:
+    start: 8
+    end: 23
+  aggressiveness: "aggressive"
+
+# ── Website / Site Builder ────────────────────────────────────────
+sites:
+  enabled: true
+  projects_dir: "/data/projects"
+  port_range_start: 4000
+  port_range_end: 4999
+  auto_commit: true
+  max_concurrent_servers: 3
+
+# ── Voice (disabled by default in Docker) ────────────────────────
+tts:
+  enabled: false
+  provider: "edge"
+  voice: "en-US-AriaNeural"
+  rate: "+0%"
+  volume: "+0%"
+
+# ── Active Role ───────────────────────────────────────────────────
+active_role: "personal-assistant"
