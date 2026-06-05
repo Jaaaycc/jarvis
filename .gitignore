@@ -62,3 +62,4 @@ eng.traineddata
 # Ignore agent files
 CLAUDE.md
 AGENTS.md
+config.yaml
