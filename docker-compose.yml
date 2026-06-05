@@ -12,6 +12,7 @@ services:
       dockerfile: Dockerfile
     container_name: jarvis
     restart: unless-stopped
+    command: ["start", "--no-open", "--data-dir", "/data"]
     ports:
       - "3142:3142"
     volumes:
@@ -19,6 +20,7 @@ services:
       - jarvis-data:/data
       # Mount your config file so keys survive container rebuilds
       - ./config.yaml:/data/config.yaml:ro
+      - ./scripts:/home/jarvis/scripts:ro
     environment:
       # ── LLM ──────────────────────────────────────────────────
       # Primary: Anthropic Claude (recommended)

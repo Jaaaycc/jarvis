@@ -53,6 +53,10 @@ function objectTypeToRoomKey(t: ObjectType): RoomKey {
     case "content":
     case "workspaces":
     case "settings":
+    case "analytics":
+    case "imagegen":
+    case "emailmktg":
+    case "meta":
       return t;
   }
 }
@@ -74,6 +78,10 @@ const ROOM_KEYS_SET: ReadonlySet<RoomKey> = new Set([
   "content",
   "workspaces",
   "settings",
+  "analytics",
+  "imagegen",
+  "emailmktg",
+  "meta",
 ]);
 
 function isRoomKey(k: string): k is RoomKey {

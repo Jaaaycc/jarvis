@@ -12,6 +12,10 @@ import { TasksRoomBody } from "./tasks/TasksRoom";
 import { ContentRoomBody } from "./content/ContentRoom";
 import { WorkspacesRoomBody } from "./workspaces/WorkspacesRoom";
 import { SettingsRoomBody } from "./settings/SettingsRoom";
+import { AnalyticsRoomBody } from "./analytics/AnalyticsRoom";
+import { ImageGenRoomBody } from "./imagegen/ImageGenRoom";
+import { EmailMktgRoomBody } from "./emailmktg/EmailMktgRoom";
+import { MetaRoomBody } from "./meta/MetaRoom";
 
 export type RoomBodyMode = "inline" | "expanded";
 
@@ -38,6 +42,10 @@ const REGISTRY: Partial<Record<RoomKey, RoomBodyComponent>> = {
   content: ContentRoomBody,
   workspaces: WorkspacesRoomBody,
   settings: SettingsRoomBody,
+  analytics: AnalyticsRoomBody,
+  imagegen: ImageGenRoomBody,
+  emailmktg: EmailMktgRoomBody,
+  meta: MetaRoomBody,
 };
 
 /**

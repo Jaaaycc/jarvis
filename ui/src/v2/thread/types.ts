@@ -18,7 +18,11 @@ export type ObjectType =
   | "tasks"
   | "content"
   | "workspaces"
-  | "settings";
+  | "settings"
+  | "analytics"
+  | "imagegen"
+  | "emailmktg"
+  | "meta";
 
 export type JarvisSpeechStatus = "speaking" | "done";
 

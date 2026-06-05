@@ -9,10 +9,13 @@ import {
   CornerDownLeft,
   Eye,
   FileText,
+  Image,
+  Mail,
   Search,
   Shield,
   Target,
   Terminal,
+  TrendingUp,
   UserCircle2,
   Workflow,
   type LucideIcon,
@@ -56,6 +59,10 @@ const NAV_ICON: Record<PaletteNavEntry["key"], LucideIcon> = {
   content: FileText,
   workspaces: Code2,
   settings: Cog,
+  analytics: TrendingUp,
+  imagegen: Image,
+  emailmktg: Mail,
+  meta: UserCircle2,
 };
 
 const TYPE_LABEL: Record<PaletteResultType, string> = {

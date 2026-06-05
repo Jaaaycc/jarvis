@@ -40,7 +40,11 @@ export type PaletteNavEntry = {
     | "tasks"
     | "content"
     | "workspaces"
-    | "settings";
+    | "settings"
+    | "analytics"
+    | "imagegen"
+    | "emailmktg"
+    | "meta";
   label: string;
   hint: string;
 };
@@ -58,6 +62,10 @@ export const ROOM_NAV_ENTRIES: PaletteNavEntry[] = [
   { key: "content", label: "Content", hint: "Drafts, scheduled, published" },
   { key: "workspaces", label: "Workspaces", hint: "Dev projects, git, dev servers" },
   { key: "settings", label: "Settings", hint: "Providers, voice, shortcuts" },
+  { key: "analytics", label: "Analytics", hint: "Google Search Console + GA4 insights" },
+  { key: "imagegen", label: "Image Creator", hint: "AI image generation studio" },
+  { key: "emailmktg", label: "Email Marketing", hint: "Campaigns, leads, automated outreach" },
+  { key: "meta", label: "Meta Business", hint: "Facebook/Instagram ads + commerce" },
 ];
 
 /**
@@ -78,7 +86,11 @@ export function navKeyToObjectType(
   | "tasks"
   | "content"
   | "workspaces"
-  | "settings" {
+  | "settings"
+  | "analytics"
+  | "imagegen"
+  | "emailmktg"
+  | "meta" {
   switch (key) {
     case "workflows":
       return "workflow";

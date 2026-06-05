@@ -1728,7 +1728,10 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
           const auth = new GoogleAuth(googleConfig.client_id, googleConfig.client_secret);
           const scopes = [
             'https://www.googleapis.com/auth/gmail.readonly',
+            'https://www.googleapis.com/auth/gmail.send',
             'https://www.googleapis.com/auth/calendar.readonly',
+            'https://www.googleapis.com/auth/webmasters.readonly',
+            'https://www.googleapis.com/auth/analytics.readonly',
           ];
           const authUrl = auth.getAuthUrl(scopes);
           return json({ auth_url: authUrl });
@@ -3609,6 +3612,613 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
         } catch (err) {
           return error(err instanceof Error ? err.message : String(err));
         }
+      },
+    },
+
+    // --- Analytics: Google Search Console proxy ---
+    '/api/analytics/search-console': {
+      GET: async (req: Request) => {
+        const url = new URL(req.url);
+        const siteUrl = url.searchParams.get('siteUrl') ?? '';
+        const dateRange = url.searchParams.get('dateRange') ?? '28d';
+        const dimension = url.searchParams.get('dimension') ?? 'query';
+
+        if (!siteUrl) return error('siteUrl is required');
+
+        const googleConfig = ctx.config.google;
+        if (!googleConfig?.client_id || !googleConfig?.client_secret) {
+          return error('Google not configured', 403);
+        }
+
+        try {
+          const { GoogleAuth } = await import('../integrations/google-auth.ts');
+          const auth = new GoogleAuth(googleConfig.client_id, googleConfig.client_secret);
+          const tokens = await auth.loadTokens();
+          if (!tokens?.access_token) return error('Google not authenticated — please connect in Settings', 401);
+
+          // Compute date range
+          const endDate = new Date();
+          const days = dateRange === '7d' ? 7 : dateRange === '90d' ? 90 : dateRange === '180d' ? 180 : 28;
+          const startDate = new Date(endDate);
+          startDate.setDate(startDate.getDate() - days);
+          const fmt = (d: Date) => d.toISOString().split('T')[0]!;
+
+          const body = {
+            startDate: fmt(startDate),
+            endDate: fmt(endDate),
+            dimensions: [dimension],
+            rowLimit: 50,
+          };
+
+          const r = await fetch(
+            `https://searchconsole.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`,
+            {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${tokens.access_token}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(body),
+            }
+          );
+
+          if (!r.ok) {
+            const txt = await r.text();
+            return error(`Search Console API error ${r.status}: ${txt}`, r.status as any);
+          }
+
+          const data = await r.json() as any;
+          const rows: any[] = data.rows ?? [];
+          const totalClicks = rows.reduce((s: number, r: any) => s + (r.clicks ?? 0), 0);
+          const totalImpressions = rows.reduce((s: number, r: any) => s + (r.impressions ?? 0), 0);
+          const avgCtr = rows.length > 0 ? rows.reduce((s: number, r: any) => s + (r.ctr ?? 0), 0) / rows.length : 0;
+          const avgPosition = rows.length > 0 ? rows.reduce((s: number, r: any) => s + (r.position ?? 0), 0) / rows.length : 0;
+
+          return json({ siteUrl, rows, totalClicks, totalImpressions, avgCtr, avgPosition });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return error(`Search Console error: ${msg}`, 500);
+        }
+      },
+    },
+
+    // --- Analytics: Google Analytics 4 proxy ---
+    '/api/analytics/ga4': {
+      GET: async (req: Request) => {
+        const url = new URL(req.url);
+        const propertyId = url.searchParams.get('propertyId') ?? '';
+        const dateRange = url.searchParams.get('dateRange') ?? '28d';
+
+        if (!propertyId) return error('propertyId is required');
+
+        const googleConfig = ctx.config.google;
+        if (!googleConfig?.client_id || !googleConfig?.client_secret) {
+          return error('Google not configured', 403);
+        }
+
+        try {
+          const { GoogleAuth } = await import('../integrations/google-auth.ts');
+          const auth = new GoogleAuth(googleConfig.client_id, googleConfig.client_secret);
+          const tokens = await auth.loadTokens();
+          if (!tokens?.access_token) return error('Google not authenticated', 401);
+
+          const days = dateRange === '7d' ? '7daysAgo' : dateRange === '90d' ? '90daysAgo' : dateRange === '180d' ? '180daysAgo' : '28daysAgo';
+
+          const requestBody = {
+            dateRanges: [{ startDate: days, endDate: 'today' }],
+            metrics: [
+              { name: 'sessions' },
+              { name: 'activeUsers' },
+              { name: 'screenPageViews' },
+              { name: 'bounceRate' },
+            ],
+            dimensions: [],
+          };
+
+          const pagesBody = {
+            dateRanges: [{ startDate: days, endDate: 'today' }],
+            metrics: [{ name: 'screenPageViews' }, { name: 'sessions' }],
+            dimensions: [{ name: 'pagePath' }],
+            orderBys: [{ metric: { metricName: 'screenPageViews' }, desc: true }],
+            limit: 10,
+          };
+
+          const sourceBody = {
+            dateRanges: [{ startDate: days, endDate: 'today' }],
+            metrics: [{ name: 'sessions' }],
+            dimensions: [{ name: 'sessionSource' }],
+            orderBys: [{ metric: { metricName: 'sessions' }, desc: true }],
+            limit: 10,
+          };
+
+          const [overviewR, pagesR, sourceR] = await Promise.all([
+            fetch(`https://analyticsdata.googleapis.com/v1beta/properties/${propertyId}:runReport`, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${tokens.access_token}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify(requestBody),
+            }),
+            fetch(`https://analyticsdata.googleapis.com/v1beta/properties/${propertyId}:runReport`, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${tokens.access_token}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify(pagesBody),
+            }),
+            fetch(`https://analyticsdata.googleapis.com/v1beta/properties/${propertyId}:runReport`, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${tokens.access_token}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify(sourceBody),
+            }),
+          ]);
+
+          if (!overviewR.ok) {
+            const txt = await overviewR.text();
+            return error(`GA4 API error ${overviewR.status}: ${txt}`, overviewR.status as any);
+          }
+
+          const METRIC_LABELS: Record<string, string> = {
+            sessions: 'Sessions',
+            activeUsers: 'Active Users',
+            screenPageViews: 'Page Views',
+            bounceRate: 'Bounce Rate',
+          };
+
+          const overview = await overviewR.json() as any;
+          const metrics = (overview.rows?.[0]?.metricValues ?? []).map((v: any, i: number) => ({
+            name: METRIC_LABELS[overview.metricHeaders?.[i]?.name] ?? overview.metricHeaders?.[i]?.name ?? 'Metric',
+            value: overview.metricHeaders?.[i]?.name === 'bounceRate'
+              ? `${(parseFloat(v.value) * 100).toFixed(1)}%`
+              : parseInt(v.value ?? '0').toLocaleString(),
+          }));
+
+          const pagesData = pagesR.ok ? await pagesR.json() as any : { rows: [] };
+          const topPages = (pagesData.rows ?? []).map((r: any) => ({
+            pagePath: r.dimensionValues?.[0]?.value ?? '/',
+            screenPageViews: parseInt(r.metricValues?.[0]?.value ?? '0').toLocaleString(),
+            sessions: parseInt(r.metricValues?.[1]?.value ?? '0').toLocaleString(),
+            bounceRate: '—',
+          }));
+
+          const sourceData = sourceR.ok ? await sourceR.json() as any : { rows: [] };
+          const trafficSources = (sourceData.rows ?? []).map((r: any) => ({
+            source: r.dimensionValues?.[0]?.value ?? 'unknown',
+            sessions: parseInt(r.metricValues?.[0]?.value ?? '0').toLocaleString(),
+          }));
+
+          return json({ propertyId, metrics, topPages, trafficSources });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return error(`GA4 error: ${msg}`, 500);
+        }
+      },
+    },
+
+    // --- Image Generation ---
+    '/api/imagegen': {
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as { prompt: string; width?: number; height?: number };
+          if (!body.prompt) return error('prompt is required');
+
+          const w = body.width ?? 1024;
+          const h = body.height ?? 1024;
+
+          // Try Stability AI if key is configured
+          const stabilityKey = (ctx.config as any).stability?.api_key;
+          if (stabilityKey) {
+            const r = await fetch('https://api.stability.ai/v1/generation/stable-diffusion-xl-1024-v1-0/text-to-image', {
+              method: 'POST',
+              headers: {
+                Accept: 'application/json',
+                Authorization: `Bearer ${stabilityKey}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                text_prompts: [{ text: body.prompt, weight: 1 }],
+                cfg_scale: 7,
+                height: h,
+                width: w,
+                steps: 30,
+                samples: 1,
+              }),
+            });
+
+            if (r.ok) {
+              const data = await r.json() as any;
+              const b64 = data.artifacts?.[0]?.base64;
+              if (b64) {
+                return json({ url: `data:image/png;base64,${b64}`, provider: 'stability' });
+              }
+            }
+          }
+
+          // Fall back to Pollinations
+          const encoded = encodeURIComponent(body.prompt);
+          const url = `https://image.pollinations.ai/prompt/${encoded}?width=${w}&height=${h}&seed=${Date.now()}&nologo=true`;
+          return json({ url, provider: 'pollinations' });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return error(`Image generation failed: ${msg}`, 500);
+        }
+      },
+    },
+
+    // --- Email Marketing: Campaigns ---
+    '/api/emailmktg/campaigns': {
+      GET: async () => {
+        try {
+          const db = getDb();
+          const rows = db.prepare(`
+            SELECT * FROM emailmktg_campaigns ORDER BY created_at DESC
+          `).all() as any[];
+          return json(rows.map((r: any) => ({
+            id: r.id, name: r.name, subject: r.subject,
+            fromName: r.from_name, fromEmail: r.from_email, body: r.body,
+            recipientCount: r.recipient_count ?? 0, status: r.status,
+            sentAt: r.sent_at, opens: r.opens, clicks: r.clicks,
+            createdAt: r.created_at,
+          })));
+        } catch {
+          return json([]);
+        }
+      },
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as any;
+          const db = getDb();
+          db.prepare(`
+            CREATE TABLE IF NOT EXISTS emailmktg_campaigns (
+              id TEXT PRIMARY KEY,
+              name TEXT, subject TEXT, from_name TEXT, from_email TEXT,
+              body TEXT, recipient_count INTEGER DEFAULT 0, status TEXT DEFAULT 'draft',
+              sent_at TEXT, opens INTEGER DEFAULT 0, clicks INTEGER DEFAULT 0,
+              created_at TEXT DEFAULT (datetime('now'))
+            )
+          `).run();
+          db.prepare(`
+            INSERT INTO emailmktg_campaigns (id, name, subject, from_name, from_email, body, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'draft', ?)
+          `).run(body.id, body.name, body.subject, body.fromName, body.fromEmail, body.body, new Date().toISOString());
+          return json(body);
+        } catch (err) {
+          return error(String(err), 500);
+        }
+      },
+    },
+
+    '/api/emailmktg/campaigns/:id': {
+      PATCH: async (req: Request) => {
+        try {
+          const id = new URL(req.url).pathname.split('/').pop()!;
+          const body = await req.json() as any;
+          const db = getDb();
+          const sets: string[] = [];
+          const vals: any[] = [];
+          if (body.name !== undefined) { sets.push('name = ?'); vals.push(body.name); }
+          if (body.subject !== undefined) { sets.push('subject = ?'); vals.push(body.subject); }
+          if (body.fromName !== undefined) { sets.push('from_name = ?'); vals.push(body.fromName); }
+          if (body.fromEmail !== undefined) { sets.push('from_email = ?'); vals.push(body.fromEmail); }
+          if (body.body !== undefined) { sets.push('body = ?'); vals.push(body.body); }
+          if (body.status !== undefined) { sets.push('status = ?'); vals.push(body.status); }
+          if (sets.length === 0) return json({ ok: true });
+          vals.push(id);
+          db.prepare(`UPDATE emailmktg_campaigns SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+          return json({ ok: true });
+        } catch (err) { return error(String(err), 500); }
+      },
+      DELETE: async (req: Request) => {
+        try {
+          const id = new URL(req.url).pathname.split('/').pop()!;
+          const db = getDb();
+          db.prepare('DELETE FROM emailmktg_campaigns WHERE id = ?').run(id);
+          return json({ ok: true });
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    '/api/emailmktg/campaigns/:id/send': {
+      POST: async (req: Request) => {
+        try {
+          const id = new URL(req.url).pathname.split('/')[4]!;
+          const db = getDb();
+
+          const campaign = db.prepare('SELECT * FROM emailmktg_campaigns WHERE id = ?').get(id) as any;
+          if (!campaign) return error('Campaign not found', 404);
+
+          const leads = db.prepare("SELECT * FROM emailmktg_leads WHERE has_website = 0 AND emailed = 0 AND email IS NOT NULL AND email != ''").all() as any[];
+          if (leads.length === 0) return error('No unemailed leads with email addresses found', 400);
+
+          const googleConfig = ctx.config.google;
+          if (!googleConfig?.client_id || !googleConfig?.client_secret) {
+            return error('Google not configured', 403);
+          }
+
+          const { GoogleAuth } = await import('../integrations/google-auth.ts');
+          const auth = new GoogleAuth(googleConfig.client_id, googleConfig.client_secret);
+          const tokens = await auth.loadTokens();
+          if (!tokens?.access_token) return error('Google not authenticated', 401);
+
+          let sent = 0;
+          for (const lead of leads.slice(0, 100)) { // max 100 per send
+            const body = campaign.body.replace(/\{\{business_name\}\}/g, lead.business_name ?? 'there');
+            const emailMessage = [
+              `From: ${campaign.from_name} <${campaign.from_email}>`,
+              `To: ${lead.email}`,
+              `Subject: ${campaign.subject}`,
+              `Content-Type: text/plain; charset=utf-8`,
+              '',
+              body,
+            ].join('\r\n');
+
+            const encoded = Buffer.from(emailMessage).toString('base64url');
+            const r = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${tokens.access_token}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ raw: encoded }),
+            });
+
+            if (r.ok) {
+              db.prepare('UPDATE emailmktg_leads SET emailed = 1 WHERE id = ?').run(lead.id);
+              sent++;
+            }
+          }
+
+          db.prepare("UPDATE emailmktg_campaigns SET status = 'sent', sent_at = ?, recipient_count = ? WHERE id = ?")
+            .run(new Date().toISOString(), sent, id);
+
+          return json({ ok: true, sent });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return error(`Send failed: ${msg}`, 500);
+        }
+      },
+    },
+
+    // --- Email Marketing: Leads ---
+    '/api/emailmktg/leads': {
+      GET: async () => {
+        try {
+          const db = getDb();
+          const rows = db.prepare('SELECT * FROM emailmktg_leads ORDER BY added_at DESC LIMIT 500').all() as any[];
+          return json(rows.map((r: any) => ({
+            id: r.id, businessName: r.business_name, email: r.email,
+            phone: r.phone, address: r.address, website: r.website,
+            hasWebsite: !!r.has_website, category: r.category,
+            source: r.source, addedAt: r.added_at, emailed: !!r.emailed,
+          })));
+        } catch { return json([]); }
+      },
+      DELETE: async (req: Request) => {
+        try {
+          const body = await req.json() as { ids: string[] };
+          const db = getDb();
+          for (const id of body.ids ?? []) {
+            db.prepare('DELETE FROM emailmktg_leads WHERE id = ?').run(id);
+          }
+          return json({ ok: true });
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    '/api/emailmktg/leads/scrape': {
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as { query: string; location: string };
+          if (!body.location) return error('location is required');
+
+          const db = getDb();
+          db.prepare(`
+            CREATE TABLE IF NOT EXISTS emailmktg_leads (
+              id TEXT PRIMARY KEY, business_name TEXT, email TEXT,
+              phone TEXT, address TEXT, website TEXT, has_website INTEGER DEFAULT 0,
+              category TEXT, source TEXT, added_at TEXT, emailed INTEGER DEFAULT 0
+            )
+          `).run();
+
+          // Use Google Places API (Text Search) to find businesses
+          const placesKey = (ctx.config as any).google_places_api_key ?? process.env.GOOGLE_PLACES_KEY ?? '';
+          const searchQuery = `${body.query} in ${body.location}`;
+
+          let results: any[] = [];
+
+          if (placesKey) {
+            const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(searchQuery)}&key=${placesKey}`;
+            const r = await fetch(url);
+            if (r.ok) {
+              const data = await r.json() as any;
+              results = data.results ?? [];
+            }
+          } else {
+            // Fallback: use SerpAPI-style Google search (no key needed via free endpoint)
+            // We do a best-effort scrape using the Google Maps embed JSON
+            try {
+              const searchUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(searchQuery)}&format=json&addressdetails=1&limit=20`;
+              const r = await fetch(searchUrl, { headers: { 'User-Agent': 'Jarvis/1.0 (hr@built2winweb.com)' } });
+              if (r.ok) {
+                const data = await r.json() as any[];
+                results = data.map((item: any) => ({
+                  name: item.display_name?.split(',')[0] ?? 'Unknown',
+                  formatted_address: item.display_name,
+                  website: null,
+                  source: 'nominatim',
+                }));
+              }
+            } catch {}
+          }
+
+          const leads: any[] = [];
+          for (const place of results) {
+            const hasWebsite = !!(place.website);
+            const id = `lead-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+            const lead = {
+              id,
+              business_name: place.name ?? place.display_name?.split(',')[0] ?? 'Unknown',
+              email: null,
+              phone: place.formatted_phone_number ?? null,
+              address: place.formatted_address ?? place.display_name ?? null,
+              website: place.website ?? null,
+              has_website: hasWebsite ? 1 : 0,
+              category: Array.isArray(place.types) ? place.types[0] : (body.query),
+              source: 'google_places',
+              added_at: new Date().toISOString(),
+              emailed: 0,
+            };
+            db.prepare(`
+              INSERT OR IGNORE INTO emailmktg_leads
+              (id, business_name, email, phone, address, website, has_website, category, source, added_at, emailed)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+              lead.id, lead.business_name, lead.email, lead.phone, lead.address,
+              lead.website, lead.has_website, lead.category, lead.source, lead.added_at, lead.emailed
+            );
+            leads.push({
+              id: lead.id,
+              businessName: lead.business_name,
+              email: lead.email,
+              phone: lead.phone,
+              address: lead.address,
+              website: lead.website,
+              hasWebsite: hasWebsite,
+              category: lead.category,
+              source: lead.source,
+              addedAt: lead.added_at,
+              emailed: false,
+            });
+          }
+
+          return json({
+            leads,
+            found: results.length,
+            noWebsite: leads.filter(l => !l.hasWebsite).length,
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return error(`Scrape failed: ${msg}`, 500);
+        }
+      },
+    },
+
+    // --- Meta Business ---
+    '/api/meta/status': {
+      GET: async () => {
+        try {
+          const { loadConfig } = await import('../config/loader.ts');
+          const cfg = await loadConfig();
+          const metaCfg = (cfg as any).meta;
+          const connected = !!(metaCfg?.access_token);
+          return json({
+            connected,
+            accessToken: connected ? '***' : '',
+            adAccountId: metaCfg?.ad_account_id ?? '',
+            pageId: metaCfg?.page_id ?? '',
+          });
+        } catch { return json({ connected: false }); }
+      },
+    },
+
+    '/api/meta/credentials': {
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as { accessToken: string; adAccountId: string; pageId: string };
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const cfg = await loadConfig();
+          (cfg as any).meta = {
+            access_token: body.accessToken,
+            ad_account_id: body.adAccountId,
+            page_id: body.pageId,
+          };
+          await saveConfig(cfg);
+          ctx.config = { ...ctx.config, ...(cfg as any) };
+          return json({ ok: true });
+        } catch (err) {
+          return error(String(err), 500);
+        }
+      },
+    },
+
+    '/api/meta/account': {
+      GET: async () => {
+        try {
+          const metaCfg = (ctx.config as any).meta;
+          if (!metaCfg?.access_token) return error('Meta not configured', 401);
+          const r = await fetch(
+            `https://graph.facebook.com/v19.0/me/adaccounts?fields=id,name,currency,timezone_name,account_status&access_token=${metaCfg.access_token}`
+          );
+          if (!r.ok) return error(await r.text(), r.status as any);
+          const data = await r.json() as any;
+          const acc = data.data?.[0];
+          if (!acc) return error('No ad account found', 404);
+          return json({
+            id: acc.id,
+            name: acc.name,
+            currency: acc.currency,
+            timezoneName: acc.timezone_name,
+            accountStatus: acc.account_status,
+          });
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    '/api/meta/campaigns': {
+      GET: async () => {
+        try {
+          const metaCfg = (ctx.config as any).meta;
+          if (!metaCfg?.access_token) return error('Meta not configured', 401);
+          const accountId = metaCfg.ad_account_id;
+          const r = await fetch(
+            `https://graph.facebook.com/v19.0/${accountId}/campaigns?fields=id,name,status,objective,daily_budget,lifetime_budget,created_time&access_token=${metaCfg.access_token}`
+          );
+          if (!r.ok) return error(await r.text(), r.status as any);
+          const data = await r.json() as any;
+          return json((data.data ?? []).map((c: any) => ({
+            id: c.id, name: c.name, status: c.status, objective: c.objective,
+            dailyBudget: c.daily_budget ? (parseInt(c.daily_budget) / 100).toFixed(2) : null,
+            lifetimeBudget: c.lifetime_budget ? (parseInt(c.lifetime_budget) / 100).toFixed(2) : null,
+            createdTime: c.created_time,
+          })));
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    '/api/meta/insights': {
+      GET: async () => {
+        try {
+          const metaCfg = (ctx.config as any).meta;
+          if (!metaCfg?.access_token) return error('Meta not configured', 401);
+          const accountId = metaCfg.ad_account_id;
+          const r = await fetch(
+            `https://graph.facebook.com/v19.0/${accountId}/insights?fields=spend,impressions,clicks,ctr,reach&date_preset=last_30d&access_token=${metaCfg.access_token}`
+          );
+          if (!r.ok) return error(await r.text(), r.status as any);
+          const data = await r.json() as any;
+          const ins = data.data?.[0] ?? {};
+          return json([
+            { label: 'Spend', value: ins.spend ? `$${parseFloat(ins.spend).toFixed(2)}` : '$0' },
+            { label: 'Impressions', value: ins.impressions ? parseInt(ins.impressions).toLocaleString() : '0' },
+            { label: 'Clicks', value: ins.clicks ? parseInt(ins.clicks).toLocaleString() : '0' },
+            { label: 'CTR', value: ins.ctr ? `${parseFloat(ins.ctr).toFixed(2)}%` : '0%' },
+          ]);
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    '/api/meta/posts': {
+      GET: async () => {
+        try {
+          const metaCfg = (ctx.config as any).meta;
+          if (!metaCfg?.access_token || !metaCfg?.page_id) return json([]);
+          const r = await fetch(
+            `https://graph.facebook.com/v19.0/${metaCfg.page_id}/posts?fields=id,message,created_time,likes.summary(true),comments.summary(true),shares&access_token=${metaCfg.access_token}&limit=20`
+          );
+          if (!r.ok) return json([]);
+          const data = await r.json() as any;
+          return json((data.data ?? []).map((p: any) => ({
+            id: p.id,
+            message: p.message ?? '',
+            createdTime: p.created_time,
+            likeCount: p.likes?.summary?.total_count ?? 0,
+            commentCount: p.comments?.summary?.total_count ?? 0,
+            shareCount: p.shares?.count ?? 0,
+          })));
+        } catch { return json([]); }
       },
     },
 
