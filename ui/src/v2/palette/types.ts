@@ -23,9 +23,7 @@ export type PaletteResult = {
 
 /**
  * Room navigation entries shown in the palette when the query is empty
- * or matches a Room name. Selecting one opens the Room (Phase 6 stub for
- * now). The `key` becomes the navigation route; the `label` matches the
- * Room build order from the roadmap.
+ * or matches a Room name.
  */
 export type PaletteNavEntry = {
   key:
@@ -44,63 +42,51 @@ export type PaletteNavEntry = {
     | "analytics"
     | "imagegen"
     | "emailmktg"
-    | "meta";
+    | "meta"
+    | "marketing"
+    | "videogen"
+    | "n8n";
   label: string;
   hint: string;
 };
 
 export const ROOM_NAV_ENTRIES: PaletteNavEntry[] = [
-  { key: "workflows", label: "Workflows", hint: "Run or edit saved agent flows" },
-  { key: "memory", label: "Memory", hint: "Recall what Jarvis knows" },
-  { key: "agents", label: "Agents", hint: "Roster, status, last run" },
-  { key: "authority", label: "Authority", hint: "Scopes, allowlists, approvals" },
-  { key: "tools", label: "Tools", hint: "Catalog + capability flags" },
-  { key: "logs", label: "Logs", hint: "Filterable event stream" },
-  { key: "calendar", label: "Calendar", hint: "This week + commitments" },
-  { key: "goals", label: "Goals", hint: "OKR hierarchy + scoring" },
-  { key: "tasks", label: "Tasks", hint: "Kanban + due dates + priority" },
-  { key: "content", label: "Content", hint: "Drafts, scheduled, published" },
-  { key: "workspaces", label: "Workspaces", hint: "Dev projects, git, dev servers" },
-  { key: "settings", label: "Settings", hint: "Providers, voice, shortcuts" },
-  { key: "analytics", label: "Analytics", hint: "Google Search Console + GA4 insights" },
-  { key: "imagegen", label: "Image Creator", hint: "AI image generation studio" },
-  { key: "emailmktg", label: "Email Marketing", hint: "Campaigns, leads, automated outreach" },
-  { key: "meta", label: "Meta Business", hint: "Facebook/Instagram ads + commerce" },
+  // ── Marketing & Business ──────────────────────────────────────
+  { key: "marketing",  label: "Marketing",       hint: "Daily posts, content, Facebook publishing" },
+  { key: "videogen",   label: "Video Studio",    hint: "AI-generated reels for Built2Win" },
+  { key: "n8n",        label: "n8n Workflows",   hint: "Automation workflows & execution monitor" },
+  { key: "meta",       label: "Meta Business",   hint: "Facebook/Instagram ads + commerce" },
+  { key: "analytics",  label: "Analytics",       hint: "Search Console + Google Analytics" },
+  { key: "emailmktg",  label: "Email Marketing", hint: "Campaigns, leads, automated outreach" },
+  // ── Content & Planning ────────────────────────────────────────
+  { key: "content",    label: "Content",         hint: "Drafts, scheduled, published" },
+  { key: "calendar",   label: "Calendar",        hint: "Today's meetings + commitments" },
+  { key: "goals",      label: "Goals",           hint: "OKRs + scoring" },
+  { key: "tasks",      label: "Tasks",           hint: "Kanban + priorities" },
+  // ── System ────────────────────────────────────────────────────
+  { key: "workflows",  label: "Workflows",       hint: "Agent automation flows" },
+  { key: "agents",     label: "Agents",          hint: "Specialist agent roster" },
+  { key: "memory",     label: "Memory",          hint: "What Jarvis knows" },
+  { key: "settings",   label: "Settings",        hint: "Providers, voice, integrations" },
+  // ── Advanced ─────────────────────────────────────────────────
+  { key: "imagegen",   label: "Image Creator",   hint: "AI image generation" },
+  { key: "tools",      label: "Tools",           hint: "Capability catalog" },
+  { key: "authority",  label: "Authority",       hint: "Scopes and approvals" },
+  { key: "logs",       label: "Logs",            hint: "Event stream" },
+  { key: "workspaces", label: "Workspaces",      hint: "Dev projects" },
 ];
 
 /**
  * Map a palette Room nav key to the `ObjectType` used by `<InlineCard>`.
- * 1:1 except `workflows` → `workflow`, `agents` → `agent`, `logs` → `log`.
  */
-export function navKeyToObjectType(
-  key: PaletteNavEntry["key"],
-):
-  | "workflow"
-  | "memory"
-  | "tool"
-  | "agent"
-  | "authority"
-  | "log"
-  | "calendar"
-  | "goals"
-  | "tasks"
-  | "content"
-  | "workspaces"
-  | "settings"
-  | "analytics"
-  | "imagegen"
-  | "emailmktg"
-  | "meta" {
+export function navKeyToObjectType(key: PaletteNavEntry["key"]): import("../thread/types").ObjectType {
   switch (key) {
-    case "workflows":
-      return "workflow";
-    case "agents":
-      return "agent";
-    case "logs":
-      return "log";
-    case "tools":
-      return "tool";
-    default:
-      return key;
+    case "workflows":  return "workflow";
+    case "memory":     return "memory";
+    case "tools":      return "tool";
+    case "agents":     return "agent";
+    case "authority":  return "authority";
+    case "logs":       return "log";
+    default:           return key as import("../thread/types").ObjectType;
   }
 }

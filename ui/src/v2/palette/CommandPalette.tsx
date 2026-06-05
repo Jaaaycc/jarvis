@@ -9,8 +9,11 @@ import {
   CornerDownLeft,
   Eye,
   FileText,
+  Film,
+  GitMerge,
   Image,
   Mail,
+  Megaphone,
   Search,
   Shield,
   Target,
@@ -63,6 +66,9 @@ const NAV_ICON: Record<PaletteNavEntry["key"], LucideIcon> = {
   imagegen: Image,
   emailmktg: Mail,
   meta: UserCircle2,
+  marketing: Megaphone,
+  videogen: Film,
+  n8n: GitMerge,
 };
 
 const TYPE_LABEL: Record<PaletteResultType, string> = {
@@ -425,8 +431,4 @@ function mapNavToType(key: PaletteNavEntry["key"]): PaletteResultType {
     case "logs":
       return "log";
     default:
-      // Calendar/Goals/Sites/Settings have no first-class object icon yet —
-      // reuse `tool` as a neutral default until Phase 6 adds dedicated glyphs.
-      return "tool";
-  }
-}
+      // Calendar/Goals/Sites/Settings have no first-class object icon 

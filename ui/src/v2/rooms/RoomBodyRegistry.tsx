@@ -16,6 +16,9 @@ import { AnalyticsRoomBody } from "./analytics/AnalyticsRoom";
 import { ImageGenRoomBody } from "./imagegen/ImageGenRoom";
 import { EmailMktgRoomBody } from "./emailmktg/EmailMktgRoom";
 import { MetaRoomBody } from "./meta/MetaRoom";
+import { MarketingRoomBody } from "./marketing/MarketingRoom";
+import { N8nRoomBody } from "./n8n/N8nRoom";
+import { VideoGenRoomBody } from "./videogen/VideoGenRoom";
 
 export type RoomBodyMode = "inline" | "expanded";
 
@@ -46,6 +49,9 @@ const REGISTRY: Partial<Record<RoomKey, RoomBodyComponent>> = {
   imagegen: ImageGenRoomBody,
   emailmktg: EmailMktgRoomBody,
   meta: MetaRoomBody,
+  marketing: MarketingRoomBody,
+  n8n: N8nRoomBody,
+  videogen: VideoGenRoomBody,
 };
 
 /**
@@ -54,21 +60,4 @@ const REGISTRY: Partial<Record<RoomKey, RoomBodyComponent>> = {
  * renders predictably during the transitional Phase 6.x window.
  */
 export function getRoomBody(key: RoomKey): RoomBodyComponent {
-  return REGISTRY[key] ?? ComingSoonBody;
-}
-
-function ComingSoonBody() {
-  return (
-    <div
-      style={{
-        padding: "var(--s-8)",
-        fontFamily: "var(--font-display)",
-        fontStyle: "italic",
-        color: "var(--ink-3)",
-        textAlign: "center",
-      }}
-    >
-      This Room hasn't been built yet — Phase 6.2+ will fill it in.
-    </div>
-  );
-}
+  return REGISTRY[key] ?

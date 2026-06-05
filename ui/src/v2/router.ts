@@ -26,7 +26,10 @@ export type RoomKey =
   | "analytics"
   | "imagegen"
   | "emailmktg"
-  | "meta";
+  | "meta"
+  | "marketing"
+  | "videogen"
+  | "n8n";
 
 export type V2Route =
   | { kind: "home" }
@@ -50,6 +53,9 @@ const ROOM_KEYS: ReadonlySet<RoomKey> = new Set([
   "imagegen",
   "emailmktg",
   "meta",
+  "marketing",
+  "videogen",
+  "n8n",
 ]);
 
 export function getV2Route(): V2Route {
@@ -91,7 +97,4 @@ export function openRoom(key: RoomKey): void {
   navigateV2({ kind: "room", key });
 }
 
-/** Convenience: close any open Room and return to the thread. */
-export function closeRoom(): void {
-  navigateV2({ kind: "home" });
-}
+/** Convenience: close a

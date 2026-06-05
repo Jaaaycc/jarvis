@@ -160,6 +160,7 @@ export class WebSocketService implements Service {
   // Phase 6.3.5b — voice approve/cancel for pending approvals.
   private approvalManager: ApprovalManager | null = null;
   private deferredExecutor: DeferredExecutor | null = null;
+  private jarvisConfig: Record<string, unknown> | null = null;
   // Audit trail used to tag voice-channel resolutions separately from
   // dashboard clicks. See gateVoiceApprovalResolution + resolveLatestPendingByVoice.
   private auditTrail: AuditTrail | null = null;
@@ -202,6 +203,11 @@ export class WebSocketService implements Service {
 
   setAuditTrail(audit: AuditTrail): void {
     this.auditTrail = audit;
+  }
+
+  /** Provide the loaded Jarvis config so the morning briefing can read it. */
+  setJarvisConfig(cfg: Record<string, unknown>): void {
+    this.jarvisConfig = cfg;
   }
 
   /**
@@ -293,8 +299,50 @@ export class WebSocketService implements Service {
       this.wsServer.setHandler({
         onMessage: (msg, ws) => this.routeMessage(msg, ws),
         onBinaryMessage: (data, ws) => this.handleVoiceAudio(data, ws),
-        onConnect: (_ws) => {
+        onConnect: (ws) => {
           console.log('[WSService] Client connected');
+          // ── Morning briefing — fires once per session on dashboard connect ──
+          setTimeout(() => {
+            try {
+              const now = new Date();
+              const hour = now.getHours();
+              const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+              const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+              const cfg = (this.jarvisConfig ?? {}) as any;
+              const company = cfg?.company ?? { name: 'Built2Win Web' };
+
+              const briefingLines: string[] = [
+                `${greeting}, Jacob! 🚀 Today is ${dateStr}.`,
+                ``,
+                `📊 **${company.name} Daily Briefing**`,
+                `Say "open marketing" to see today's ready-to-post content.`,
+                `Say "open calendar" to view your meetings.`,
+                `Say "open n8n" to check your automation workflows.`,
+                `Say "generate my reels" to create today's video content.`,
+              ];
+
+              // Check if Facebook is configured
+              if (!cfg?.facebook?.page_access_token) {
+                briefingLines.push(`⚠️  Facebook not connected — say "open settings" to link your page.`);
+              }
+              if (!cfg?.n8n?.api_key) {
+                briefingLines.push(`⚠️  n8n not connected — add your API key in Settings → Integrations.`);
+              }
+
+              const briefingMsg: import('../comms/websocket.ts').WSMessage = {
+                type: 'chat',
+                payload: {
+                  text: briefingLines.join('\n'),
+                  source: 'morning_briefing',
+                },
+                priority: 'normal',
+                timestamp: Date.now(),
+              };
+              this.wsServer.sendToClient(ws, briefingMsg);
+            } catch (e) {
+              console.warn('[WSService] Morning briefing failed:', e);
+            }
+          }, 800); // slight delay so the UI is ready
         },
         onDisconnect: (ws) => {
           // Clean up every per-socket map so a long-running daemon doesn't

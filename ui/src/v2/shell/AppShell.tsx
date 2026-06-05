@@ -57,6 +57,9 @@ function objectTypeToRoomKey(t: ObjectType): RoomKey {
     case "imagegen":
     case "emailmktg":
     case "meta":
+    case "marketing":
+    case "videogen":
+    case "n8n":
       return t;
   }
 }
@@ -82,6 +85,9 @@ const ROOM_KEYS_SET: ReadonlySet<RoomKey> = new Set([
   "imagegen",
   "emailmktg",
   "meta",
+  "marketing",
+  "videogen",
+  "n8n",
 ]);
 
 function isRoomKey(k: string): k is RoomKey {
@@ -973,11 +979,4 @@ function ShellLayout({
           vu={vu}
           device="Default microphone"
           partialTranscript={partialTranscript}
-          onTapOrb={onTapOrb}
-          onSuggestion={onSuggestion}
-          onToggleMute={onToggleMute}
-        />
-      </div>
-    </div>
-  );
-}
+          on

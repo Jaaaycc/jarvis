@@ -4222,6 +4222,335 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
       },
     },
 
+
+    // ─── Marketing Routes ─────────────────────────────────────────────
+
+    '/api/marketing/generate': {
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as { company?: string; count?: number; types?: string[] };
+          const cfg = ctx.config as any;
+          const company = cfg.company ?? { name: 'Built2Win Web', niche: 'web design', brand_voice: 'confident and technical', usp: 'Lighthouse 100, flat fee' };
+          const count = body.count ?? 2;
+
+          const prompt = `You are a social media expert for ${company.name}.
+Generate ${count} social media posts for Instagram/Facebook.
+Brand: ${company.name} — ${company.tagline ?? ''}
+Niche: ${company.niche}
+Voice: ${company.brand_voice}
+USP: ${company.usp}
+Services: ${(company.services ?? []).join(', ')}
+
+For each post generate:
+1. type: "reel" or "static"
+2. hook: attention-grabbing first line (max 10 words)
+3. caption: full post caption (150-200 words, includes value + story + CTA)
+4. hashtags: 15 relevant hashtags
+5. cta: call-to-action text
+6. platform: "instagram" or "facebook"
+
+Return valid JSON array of ${count} posts.`;
+
+          const llmService = (ctx as any).agentService?.getLLMService?.();
+          let posts: any[] = [];
+
+          if (llmService) {
+            const resp = await llmService.chat([{ role: 'user', content: prompt }]);
+            try {
+              const jsonMatch = resp.match(/\[[\s\S]*\]/);
+              if (jsonMatch) posts = JSON.parse(jsonMatch[0]);
+            } catch { posts = []; }
+          }
+
+          if (!posts.length) {
+            posts = [
+              {
+                type: 'reel',
+                hook: 'Your website is losing you customers every single day.',
+                caption: `Most local businesses in your area don't have a professional website — and the ones that do are paying $200+/month just to keep it running. At ${company.name}, we build custom PHP websites that score 100 on Google's Lighthouse test, load in under 1 second, and cost a flat fee with zero monthly subscriptions. One payment. No ongoing fees. Your site ranks higher than WordPress sites that cost 3x more. Want proof? Check our portfolio at built2winweb.com and see real results for real businesses. DM us "WEBSITE" and we'll send you a free competitive analysis of your market.`,
+                hashtags: ['#webdesign', '#customwebsite', '#localbusiness', '#seo', '#webdevelopment', '#lighthouse100', '#php', '#florida', '#smallbusiness', '#digitalmarketing', '#websitedesign', '#googlerankings', '#nomonthlyFees', '#built2winweb', '#flatfee'],
+                cta: 'Get your free quote at built2winweb.com',
+                platform: 'instagram',
+              },
+              {
+                type: 'static',
+                hook: 'I just built a website that ranks #1 in West Palm Beach.',
+                caption: `No WordPress. No page builders. No plugin subscriptions. Just clean, fast, custom PHP code that Google loves. The business owner called me 3 weeks after launch — they had 12 new leads from organic search alone. That's what a Lighthouse 100 score actually does for your revenue. At ${company.name} we don't use templates. Every site is hand-coded from scratch, optimized for your specific city and service, and delivered in 30 days flat. Flat fee pricing: $1,750 for a business site, $5,600 for ecommerce. Call or text 561-301-7130 for a free consultation.`,
+                hashtags: ['#webdeveloper', '#websitedesign', '#localseo', '#customcode', '#webdesign', '#php', '#westpalmbeach', '#miami', '#florida', '#smallbusiness', '#ecommerce', '#lighthouse', '#seoexpert', '#digitalagency', '#built2win'],
+                cta: 'Call or text: 561-301-7130',
+                platform: 'facebook',
+              },
+            ];
+          }
+
+          return json({ posts, generatedAt: new Date().toISOString() });
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    '/api/marketing/post-to-facebook': {
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as { caption: string; pageId?: string; imageUrl?: string };
+          const cfg = ctx.config as any;
+          const pageId = body.pageId ?? cfg.facebook?.page_id ?? '';
+          const token = cfg.facebook?.page_access_token ?? '';
+
+          if (!pageId || !token) return error('Facebook page not configured. Add page_id and page_access_token to config.yaml', 401);
+
+          const payload: any = { message: body.caption, access_token: token };
+          if (body.imageUrl) payload.url = body.imageUrl;
+
+          const endpoint = body.imageUrl
+            ? `https://graph.facebook.com/v19.0/${pageId}/photos`
+            : `https://graph.facebook.com/v19.0/${pageId}/feed`;
+
+          const r = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+
+          if (!r.ok) return error(await r.text(), r.status as any);
+          const result = await r.json() as any;
+          return json({ ok: true, postId: result.id, url: `https://facebook.com/${result.id}` });
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    '/api/marketing/generate-script': {
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as { topic: string; platform: string; tone: string };
+          const cfg = ctx.config as any;
+          const company = cfg.company ?? { name: 'Built2Win Web', niche: 'web design' };
+
+          const prompt = `Write a ${body.platform} video script for ${company.name} (${company.niche ?? 'web design agency'}).
+Topic: ${body.topic}
+Tone: ${body.tone}
+Duration: 30-60 seconds
+
+Return JSON with: { hook (first 3 seconds, shocking/curious), body (main content, 3-4 points), cta (call to action), hashtags (15), duration_estimate }`;
+
+          const llmService = (ctx as any).agentService?.getLLMService?.();
+          let script: any = null;
+
+          if (llmService) {
+            const resp = await llmService.chat([{ role: 'user', content: prompt }]);
+            try { const m = resp.match(/\{[\s\S]*\}/); if (m) script = JSON.parse(m[0]); } catch {}
+          }
+
+          if (!script) {
+            script = {
+              hook: `${company.name} just changed how local businesses get found online.`,
+              body: `We build custom PHP websites — no WordPress, no monthly fees. Lighthouse 100 scores guaranteed. Your site loads faster than 99% of competitors. Local SEO built in from day one. 30-day delivery. One flat payment.`,
+              cta: `Go to built2winweb.com for a free quote. Link in bio.`,
+              hashtags: ['#webdesign', '#seo', '#customwebsite', '#php', '#localbusiness', '#flatfee', '#lighthouse100', '#florida', '#smallbusiness', '#websitedesign'],
+              duration_estimate: '45 seconds',
+            };
+          }
+          return json(script);
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    '/api/marketing/morning-briefing': {
+      GET: async () => {
+        try {
+          const cfg = ctx.config as any;
+          const company = cfg.company ?? { name: 'Built2Win Web' };
+          const hour = new Date().getHours();
+          const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+
+          return json({
+            greeting,
+            company: company.name,
+            date: new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' }),
+            n8nConfigured: !!(cfg.n8n?.api_key),
+            facebookConfigured: !!(cfg.facebook?.page_access_token),
+            nvidiaConfigured: !!(cfg.nvidia?.api_key),
+            message: `${greeting}, Jacob! Ready to grow ${company.name} today.`,
+          });
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    // ─── n8n Routes ───────────────────────────────────────────────────
+
+    '/api/n8n/workflows': {
+      GET: async () => {
+        try {
+          const cfg = ctx.config as any;
+          const baseUrl = cfg.n8n?.base_url ?? 'https://jacobworkinai.app.n8n.cloud';
+          const apiKey = cfg.n8n?.api_key ?? '';
+          if (!apiKey) return json({ workflows: [], configured: false });
+          const r = await fetch(`${baseUrl}/api/v1/workflows`, {
+            headers: { 'X-N8N-API-KEY': apiKey, 'Content-Type': 'application/json' }
+          });
+          if (!r.ok) return error(await r.text(), r.status as any);
+          const data = await r.json() as any;
+          return json({ workflows: data.data ?? data, configured: true });
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    '/api/n8n/workflows/:id/execute': {
+      POST: async (req: Request) => {
+        try {
+          const id = new URL(req.url).pathname.split('/')[4]!;
+          const cfg = ctx.config as any;
+          const baseUrl = cfg.n8n?.base_url ?? 'https://jacobworkinai.app.n8n.cloud';
+          const apiKey = cfg.n8n?.api_key ?? '';
+          if (!apiKey) return error('n8n not configured', 401);
+          const r = await fetch(`${baseUrl}/api/v1/workflows/${id}/activate`, {
+            method: 'POST',
+            headers: { 'X-N8N-API-KEY': apiKey, 'Content-Type': 'application/json' }
+          });
+          const data = await r.json() as any;
+          return json({ ok: r.ok, result: data });
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    '/api/n8n/executions': {
+      GET: async (req: Request) => {
+        try {
+          const url = new URL(req.url);
+          const workflowId = url.searchParams.get('workflowId') ?? '';
+          const cfg = ctx.config as any;
+          const baseUrl = cfg.n8n?.base_url ?? 'https://jacobworkinai.app.n8n.cloud';
+          const apiKey = cfg.n8n?.api_key ?? '';
+          if (!apiKey) return json({ executions: [] });
+          const params = workflowId ? `?workflowId=${workflowId}&limit=20` : '?limit=20';
+          const r = await fetch(`${baseUrl}/api/v1/executions${params}`, {
+            headers: { 'X-N8N-API-KEY': apiKey }
+          });
+          const data = await r.json() as any;
+          return json({ executions: data.data ?? data });
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    '/api/n8n/import': {
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as { workflow: any };
+          const cfg = ctx.config as any;
+          const baseUrl = cfg.n8n?.base_url ?? 'https://jacobworkinai.app.n8n.cloud';
+          const apiKey = cfg.n8n?.api_key ?? '';
+          if (!apiKey) return error('n8n not configured', 401);
+          const r = await fetch(`${baseUrl}/api/v1/workflows`, {
+            method: 'POST',
+            headers: { 'X-N8N-API-KEY': apiKey, 'Content-Type': 'application/json' },
+            body: JSON.stringify(body.workflow)
+          });
+          const data = await r.json() as any;
+          return json({ ok: r.ok, workflow: data });
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    // ─── Video Generation Routes ──────────────────────────────────────
+
+    '/api/videogen/generate': {
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as { prompt: string; width?: number; height?: number };
+          const cfg = ctx.config as any;
+          const nvidiaKey = cfg.nvidia?.api_key ?? '';
+
+          if (nvidiaKey) {
+            try {
+              const r = await fetch('https://ai.api.nvidia.com/v1/genai/stabilityai/stable-video-diffusion', {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${nvidiaKey}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ prompt: body.prompt, cfg_scale: 2.5, motion_bucket_id: 127 })
+              });
+              if (r.ok) {
+                const d = await r.json() as any;
+                return json({ videoUrl: d.video ?? d.url ?? null, provider: 'nvidia', ok: true });
+              }
+            } catch {}
+          }
+
+          const encoded = encodeURIComponent(body.prompt);
+          const imageUrl = `https://image.pollinations.ai/prompt/${encoded}?width=${body.width ?? 1080}&height=${body.height ?? 1920}&seed=${Date.now()}&nologo=true`;
+          return json({ imageUrl, provider: 'pollinations', ok: true, note: 'Image placeholder — add NVIDIA API key for real video' });
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    '/api/videogen/status': {
+      GET: async () => {
+        const cfg = ctx.config as any;
+        return json({
+          nvidiaConfigured: !!(cfg.nvidia?.api_key),
+          facebookConfigured: !!(cfg.facebook?.page_access_token),
+        });
+      },
+    },
+
+
+    '/api/n8n/status': {
+      GET: async () => {
+        try {
+          const cfg = ctx.config as any;
+          return json({ configured: !!(cfg.n8n?.api_key), baseUrl: cfg.n8n?.base_url ?? '' });
+        } catch { return json({ configured: false }); }
+      },
+    },
+
+    '/api/config/n8n': {
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as { api_key: string; base_url?: string };
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const cfg = await loadConfig() as any;
+          if (!cfg.n8n) cfg.n8n = {};
+          cfg.n8n.api_key = body.api_key;
+          if (body.base_url) cfg.n8n.base_url = body.base_url;
+          await saveConfig(cfg);
+          (ctx.config as any).n8n = cfg.n8n;
+          return json({ ok: true, message: 'n8n configuration saved. Open the n8n room to connect.' });
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    '/api/config/nvidia': {
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as { api_key: string };
+          const { loadConfig, saveConfig } = await import('../config/loader.ts');
+          const cfg = await loadConfig() as any;
+          if (!cfg.nvidia) cfg.nvidia = {};
+          cfg.nvidia.api_key = body.api_key;
+          await saveConfig(cfg);
+          (ctx.config as any).nvidia = cfg.nvidia;
+          return json({ ok: true, message: 'NVIDIA API key saved. Video Studio will now use NVIDIA for generation.' });
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+
+    '/api/n8n/templates/job-hacker': {
+      GET: async () => {
+        try {
+          const wfPath = path.join(import.meta.dir, '../data/workflows/job-hacker.json');
+          if (!existsSync(wfPath)) return error('Job Hacker workflow file not found', 404);
+          const data = JSON.parse(await Bun.file(wfPath).text());
+          return json(data);
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    '/api/n8n/templates': {
+      GET: async () => {
+        return json([
+          { id: 'job-hacker', name: 'The Job Hacker 🤖', description: 'Scrapes LinkedIn jobs, customizes resumes with AI, and applies automatically. 38 nodes.', endpoint: '/api/n8n/templates/job-hacker' },
+        ]);
+      },
+    },
+
     // --- CORS preflight ---
     '/api/*': {
       OPTIONS: () => new Response(null, { status: 204, headers: CORS }),

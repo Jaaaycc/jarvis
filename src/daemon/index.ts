@@ -449,6 +449,7 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
     wsService.setDeferredExecutor(deferredExecutor);
     // Voice-channel audit tagging for forensic separation from click path.
     wsService.setAuditTrail(auditTrail);
+    wsService.setJarvisConfig(config as unknown as Record<string, unknown>);
 
     // Restore emergency state from config
     const savedEmergencyState = authorityConfig.emergency_state ?? 'normal';

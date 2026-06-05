@@ -22,7 +22,10 @@ export type ObjectType =
   | "analytics"
   | "imagegen"
   | "emailmktg"
-  | "meta";
+  | "meta"
+  | "marketing"
+  | "videogen"
+  | "n8n";
 
 export type JarvisSpeechStatus = "speaking" | "done";
 
@@ -149,7 +152,4 @@ export type VoiceIntentLite = {
   /** Human-readable label, e.g. "Send the email now". */
   label: string;
   verb: string;
-  impact: Impact;
-};
-
-export type ThreadItemKind = ThreadItem["kind"];
+  impact: Imp

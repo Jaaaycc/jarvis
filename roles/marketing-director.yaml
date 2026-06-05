@@ -166,3 +166,28 @@ tools:
 
 # Authority level (1-10 scale, 10 = highest)
 authority_level: 6
+
+# ── Morning Briefing ────────────────────────────────────────────────
+morning_briefing:
+  enabled: true
+  trigger: "session_start"
+  message_template: |
+    Good {time_of_day}, Jacob! Here's your Built2Win marketing briefing for {date}:
+
+    📅 **Today's Meetings:** {calendar_events}
+
+    📱 **Ready to Post:**
+    {daily_posts_summary}
+
+    🔄 **n8n Status:** {n8n_active_workflows} workflows running
+
+    💡 **Today's Focus:** {ai_suggestion}
+
+    Say "show my posts" to see today's content, or "open marketing" to jump in.
+
+  include:
+    - calendar_events
+    - daily_posts
+    - n8n_status
+    - weather
+    - performance_tip
