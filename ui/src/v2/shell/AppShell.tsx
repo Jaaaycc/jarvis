@@ -979,4 +979,11 @@ function ShellLayout({
           vu={vu}
           device="Default microphone"
           partialTranscript={partialTranscript}
-          on
+          onTapOrb={onTapOrb}
+          onSuggestion={onSuggestion}
+          onToggleMute={onToggleMute}
+        />
+      </div>
+    </div>
+  );
+}

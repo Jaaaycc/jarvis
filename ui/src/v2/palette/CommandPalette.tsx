@@ -431,4 +431,8 @@ function mapNavToType(key: PaletteNavEntry["key"]): PaletteResultType {
     case "logs":
       return "log";
     default:
-      // Calendar/Goals/Sites/Settings have no first-class object icon 
+      // Calendar/Goals/Sites/Settings have no first-class object icon yet —
+      // reuse `tool` as a neutral default until Phase 6 adds dedicated glyphs.
+      return "tool";
+  }
+}

@@ -97,4 +97,7 @@ export function openRoom(key: RoomKey): void {
   navigateV2({ kind: "room", key });
 }
 
-/** Convenience: close a
+/** Convenience: close any open Room and return to the thread. */
+export function closeRoom(): void {
+  navigateV2({ kind: "home" });
+}

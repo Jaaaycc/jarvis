@@ -60,4 +60,21 @@ const REGISTRY: Partial<Record<RoomKey, RoomBodyComponent>> = {
  * renders predictably during the transitional Phase 6.x window.
  */
 export function getRoomBody(key: RoomKey): RoomBodyComponent {
-  return REGISTRY[key] ?
+  return REGISTRY[key] ?? ComingSoonBody;
+}
+
+function ComingSoonBody() {
+  return (
+    <div
+      style={{
+        padding: "var(--s-8)",
+        fontFamily: "var(--font-display)",
+        fontStyle: "italic",
+        color: "var(--ink-3)",
+        textAlign: "center",
+      }}
+    >
+      This Room hasn't been built yet — Phase 6.2+ will fill it in.
+    </div>
+  );
+}
