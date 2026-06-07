@@ -32,6 +32,7 @@ import { contentPipelineTool } from '../actions/tools/content.ts';
 import { commitmentsTool } from '../actions/tools/commitments.ts';
 import { researchQueueTool } from '../actions/tools/research.ts';
 import { documentTool } from '../actions/tools/documents.ts';
+import { createMediaTools } from '../actions/tools/media.ts';
 import { AgentTaskManager } from '../agents/task-manager.ts';
 import { discoverSpecialists, formatSpecialistList } from '../agents/role-discovery.ts';
 import { buildSystemPrompt, type PromptContext } from '../roles/prompt-builder.ts';
@@ -175,6 +176,12 @@ export class AgentService implements Service, IAgentService {
 
       // Register document tool (vault-stored documents)
       toolRegistry.register(documentTool);
+
+      // Register media generation tools (Higgsfield image/video)
+      const mediaTools = createMediaTools(this.config);
+      for (const tool of mediaTools) {
+        toolRegistry.register(tool);
+      }
 
       // Register delegate_task tool if specialists are available
       if (this.specialists.size > 0) {
