@@ -978,12 +978,10 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       if (jarvisConfig.awareness?.enabled !== false && !config.noLocalTools) {
         await startAwarenessService();
       }
-    };
 
-    // Awareness service construction extracted so the post-setup helper
-    // can call it conditionally. Closes over the same boot-scope deps as
-    // the original inline block.
-    const startAwarenessService = async (): Promise<void> => {
+    // Awareness service construction (nested inside startPostSetupServices).
+    // Closes over the same boot-scope deps and is called conditionally above.
+    async function startAwarenessService(): Promise<void> {
       if (awarenessService) return;
       try {
         const { AwarenessService } = await import('../awareness/service.ts');
@@ -1253,6 +1251,270 @@ export async function startDaemon(userConfig?: Partial<DaemonConfig>): Promise<v
       } catch (err) {
         console.error('[Daemon] Awareness service failed to start:', err instanceof Error ? err.message : err);
         // Non-fatal — daemon continues without awareness
+      }
+    }
+
+      // ── 10f. Facebook / Instagram Observer ────────────────────────────────
+      if (jarvisConfig.facebook?.page_access_token) {
+        try {
+          const { FacebookObserver } = await import('../observers/facebook.ts');
+          const metaCfg = {
+            pageId: jarvisConfig.facebook.page_id,
+            pageAccessToken: jarvisConfig.facebook.page_access_token,
+            adAccountId: jarvisConfig.facebook.ad_account_id,
+            businessId: jarvisConfig.facebook.business_id,
+          };
+          const fbObserver = new FacebookObserver(metaCfg);
+          fbObserver.onEvent((event) => {
+            const classified = classifyEvent(event);
+            if (classified.priority === 'critical' || classified.priority === 'high') {
+              reactor.react(classified).catch(err =>
+                console.error('[Daemon] Facebook reaction error:', err)
+              );
+            } else {
+              coalescer.addEvent(classified);
+            }
+            sharedEventBus.publish(`observer.${event.type}`, { ...event.data, _timestamp: event.timestamp });
+          });
+          await fbObserver.start();
+          console.log('[Daemon] Facebook/Instagram observer started (comments + DMs polling)');
+        } catch (err) {
+          console.error('[Daemon] Facebook observer failed to start (non-fatal):', err instanceof Error ? err.message : err);
+        }
+      } else {
+        console.log('[Daemon] Facebook observer skipped — no page_access_token configured');
+      }
+
+      // ── 10g. Daemon Scheduler (morning briefing + post ticks) ─────────────
+      try {
+        const { DaemonScheduler } = await import('./scheduler.ts');
+        const scheduler = new DaemonScheduler({
+          morningTime: jarvisConfig.marketing?.post_time ?? '08:00',
+          activeHoursStart: jarvisConfig.heartbeat?.active_hours?.start ?? 8,
+          activeHoursEnd: jarvisConfig.heartbeat?.active_hours?.end ?? 23,
+        });
+        scheduler.onEvent((event) => {
+          const classified = classifyEvent(event);
+          if (classified.priority === 'critical' || classified.priority === 'high') {
+            reactor.react(classified).catch(err =>
+              console.error('[Daemon] Scheduler reaction error:', err)
+            );
+          } else {
+            coalescer.addEvent(classified);
+          }
+          sharedEventBus.publish(`observer.${event.type}`, { ...event.data, _timestamp: event.timestamp });
+
+          // Morning briefing: build and deliver summary via bgAgent
+          if (event.type === 'morning_briefing' && bgAgent) {
+            bgAgent.handleMessage(
+              `Good morning Jacob! Please run through the full morning briefing: ` +
+              `1) Check Google Calendar for today's meetings and alert me to anything in the next 2 hours. ` +
+              `2) Review the content pipeline and tell me what posts are scheduled for today. ` +
+              `3) Check n8n for any failed workflows or errors. ` +
+              `4) Review Built2WinWeb Facebook and Instagram — any new comments or DMs I need to respond to? ` +
+              `5) Give me today's 2 Reel ideas based on the Built2Win marketing strategy. ` +
+              `6) Use the ads_get_summary tool to pull the Meta ad account performance for the last 7 days. Highlight any critical alerts. ` +
+              `7) List any overdue commitments or tasks. ` +
+              `Format this as a clean morning briefing. Today is ${new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}.`,
+              'heartbeat'
+            ).then(briefing => {
+              if (briefing) {
+                wsService.broadcastNotification(`🌅 **Morning Briefing**\n${briefing}`, 'urgent');
+                sendDesktopNotification('JARVIS Morning Briefing', 'Your daily briefing is ready — check the dashboard.', { urgency: 'normal' });
+              }
+            }).catch(err => console.error('[Daemon] Morning briefing error:', err));
+          }
+        });
+        scheduler.start();
+        console.log(`[Daemon] Daemon scheduler started — morning briefing at ${jarvisConfig.marketing?.post_time ?? '08:00'}`);
+      } catch (err) {
+        console.error('[Daemon] Scheduler failed to start (non-fatal):', err instanceof Error ? err.message : err);
+      }
+
+      // ── 10h. Post Scheduler ───────────────────────────────────────────────
+      if (jarvisConfig.facebook?.page_access_token) {
+        try {
+          const { PostScheduler } = await import('./post-scheduler.ts');
+          const postScheduler = new PostScheduler({
+            meta: {
+              pageId: jarvisConfig.facebook.page_id,
+              pageAccessToken: jarvisConfig.facebook.page_access_token,
+              adAccountId: jarvisConfig.facebook.ad_account_id,
+              businessId: jarvisConfig.facebook.business_id,
+            },
+            igAccountId: jarvisConfig.instagram?.ig_account_id || undefined,
+            dailyReelTarget: 2,
+          });
+          postScheduler.onEvent((event) => {
+            const classified = classifyEvent(event);
+            // Reel creation requests go to bgAgent for interactive questions
+            if (event.type === 'reel_creation_request' && bgAgent) {
+              const d = event.data as any;
+              bgAgent.handleMessage(
+                `It's time to create Reel #${d.reelNumber} of ${d.dailyTarget} for today. ` +
+                `Content draft: "${d.title}" — ${d.body?.slice(0, 200)}. ` +
+                `Please ask Jacob these questions one by one: ${(d.questions as string[]).join(' | ')}`,
+                'heartbeat'
+              ).catch(err => console.error('[Daemon] Reel request error:', err));
+            }
+            if (classified.priority === 'high') {
+              reactor.react(classified).catch(err =>
+                console.error('[Daemon] Post scheduler reaction error:', err)
+              );
+            } else {
+              coalescer.addEvent(classified);
+            }
+          });
+          // Wire post scheduler to tick events from daemon scheduler
+          sharedEventBus.subscribe('observer.post_scheduler_tick', async () => {
+            try { await postScheduler.tick(); } catch (err) {
+              console.error('[Daemon] Post scheduler tick error:', err instanceof Error ? err.message : err);
+            }
+          });
+          console.log('[Daemon] Post scheduler started (checks content pipeline every 5 min)');
+        } catch (err) {
+          console.error('[Daemon] Post scheduler failed to start (non-fatal):', err instanceof Error ? err.message : err);
+        }
+      }
+
+      // ── 10i. n8n Status Monitor ───────────────────────────────────────────
+      if (jarvisConfig.n8n?.api_key) {
+        try {
+          const { getWorkflowSummary, formatWorkflowSummary } = await import('../integrations/n8n-api.ts');
+          const n8nCfg = {
+            baseUrl: jarvisConfig.n8n.base_url,
+            apiKey: jarvisConfig.n8n.api_key,
+            webhookBase: jarvisConfig.n8n.webhook_base,
+          };
+          // Subscribe to n8n sync ticks (every 10 min)
+          sharedEventBus.subscribe('observer.n8n_sync_tick', async () => {
+            try {
+              const summary = await getWorkflowSummary(n8nCfg);
+              const msg = formatWorkflowSummary(summary);
+              // Only alert if there are errors
+              if (summary.recentErrors.length > 0) {
+                const errorNames = summary.recentErrors.map((e: any) => e.workflowId).join(', ');
+                const alertText = `⚠️ n8n: ${summary.recentErrors.length} workflow error(s) detected (IDs: ${errorNames})`;
+                wsService.broadcastNotification(alertText, 'urgent');
+                sendDesktopNotification('JARVIS: n8n Workflow Error', alertText, { urgency: 'critical' });
+              }
+              console.log(`[Daemon] n8n sync: ${msg}`);
+            } catch (err) {
+              console.error('[Daemon] n8n sync error:', err instanceof Error ? err.message : err);
+            }
+          });
+          console.log('[Daemon] n8n monitor started (syncing every 10 min, alerts on errors)');
+        } catch (err) {
+          console.error('[Daemon] n8n monitor failed to start (non-fatal):', err instanceof Error ? err.message : err);
+        }
+      }
+
+      // ── 10j. Ads Optimizer ────────────────────────────────────────────────
+      if (jarvisConfig.facebook?.page_access_token && jarvisConfig.facebook?.ad_account_id) {
+        try {
+          const { AdsOptimizer } = await import('./ads-optimizer.ts');
+          const adsOptimizer = new AdsOptimizer({
+            ads: {
+              adAccountId: jarvisConfig.facebook.ad_account_id,
+              pageAccessToken: jarvisConfig.facebook.page_access_token,
+              pageId: jarvisConfig.facebook.page_id,
+              businessId: jarvisConfig.facebook.business_id,
+            },
+            meta: {
+              pageId: jarvisConfig.facebook.page_id,
+              pageAccessToken: jarvisConfig.facebook.page_access_token,
+            },
+            autoOptimize: false,   // NEVER auto-spend — Jacob approves everything
+            roasThreshold: 2.0,
+            startingBudgetUSD: 1,  // $1/day minimum test budget
+            maxDailyBudgetUSD: 5,  // $5/day cap until Jacob raises it manually
+          });
+          adsOptimizer.onEvent((event) => {
+            const classified = classifyEvent(event);
+            if (classified.priority === 'critical' || classified.priority === 'high') {
+              reactor.react(classified).catch(err =>
+                console.error('[Daemon] Ads optimizer reaction error:', err)
+              );
+              // Desktop notification for critical ad alerts
+              if (event.type === 'ads_critical_alert') {
+                const d = event.data as any;
+                sendDesktopNotification(
+                  'JARVIS: Ad Alert 🚨',
+                  `${d.name}: ${d.message}`,
+                  { urgency: 'critical' }
+                );
+              }
+            } else {
+              coalescer.addEvent(classified);
+            }
+            // Boost suggestion — ask Jacob for approval via chat
+            if (event.type === 'ads_boost_suggestion' && bgAgent) {
+              const d = event.data as any;
+              bgAgent.handleMessage(
+                `I reviewed our recent Facebook posts and found one worth advertising:\n\n` +
+                `"${d.postPreview}"\n\n` +
+                `${d.reason}\n\n` +
+                `I'd start it at $${d.suggestedBudgetUSD}/day (absolute minimum — just to test). ` +
+                `If it performs well (ROAS ≥ 2x) I'll let you know and we can decide together whether to scale. ` +
+                `Do you want me to boost this post for $${d.suggestedBudgetUSD}/day?`,
+                'heartbeat'
+              ).catch(err => console.error('[Daemon] Boost suggestion agent error:', err));
+            }
+
+            // Surface weekly audit in dashboard
+            if (event.type === 'ads_weekly_audit' && bgAgent) {
+              bgAgent.handleMessage(
+                `Here is this week's Meta Ads audit report. Please review it and tell me what I should act on first:\n\n${(event.data as any).report}`,
+                'heartbeat'
+              ).catch(err => console.error('[Daemon] Ads weekly audit agent error:', err));
+            }
+            sharedEventBus.publish(`observer.${event.type}`, { ...event.data, _timestamp: event.timestamp });
+          });
+          // Tie ads optimizer to the post_scheduler_tick (every 5 min)
+          sharedEventBus.subscribe('observer.post_scheduler_tick', async () => {
+            try { await adsOptimizer.tick(); } catch (err) {
+              console.error('[Daemon] Ads optimizer tick error:', err instanceof Error ? err.message : err);
+            }
+          });
+          console.log('[Daemon] Ads optimizer started (hourly checks, 6h optimization, weekly audit — alert-only mode)');
+
+          // Register ads agent tools so Jarvis can manage ads from chat
+          const toolRegistry = orchestrator.getToolRegistry();
+          if (toolRegistry) {
+            const { createAdsTools } = await import('../actions/tools/ads.ts');
+            const adsTools = createAdsTools(jarvisConfig);
+            for (const tool of adsTools) {
+              if (!toolRegistry.has(tool.name)) {
+                toolRegistry.register(tool);
+              }
+            }
+            console.log(`[Daemon] Registered ${adsTools.length} ads tools (ads_get_summary, ads_run_audit, ads_list_campaigns, etc.)`);
+          }
+        } catch (err) {
+          console.error('[Daemon] Ads optimizer failed to start (non-fatal):', err instanceof Error ? err.message : err);
+        }
+      } else {
+        console.log('[Daemon] Ads optimizer skipped — no ad_account_id or page_access_token configured');
+      }
+
+      // ── 10k: Higgsfield media generation tools ─────────────────────────
+      // Register image/video generation tools so Jarvis can create visuals from chat.
+      // Available even without a key configured — tools return a friendly setup message.
+      try {
+        const toolRegistry = orchestrator.getToolRegistry();
+        if (toolRegistry) {
+          const { createMediaTools } = await import('../actions/tools/media.ts');
+          const mediaTools = createMediaTools(jarvisConfig);
+          for (const tool of mediaTools) {
+            if (!toolRegistry.has(tool.name)) {
+              toolRegistry.register(tool);
+            }
+          }
+          const hasKey = !!(jarvisConfig as any)?.higgsfield?.api_key;
+          console.log(`[Daemon] Registered ${mediaTools.length} Higgsfield media tools (generate_image, animate_image, generate_video, check_generation)${hasKey ? '' : ' — API key not yet configured'}`);
+        }
+      } catch (err) {
+        console.error('[Daemon] Higgsfield media tools failed to register (non-fatal):', err instanceof Error ? err.message : err);
       }
     };
 

@@ -28,6 +28,7 @@ export { NotificationListener } from './notifications';
 export { ProcessMonitor } from './processes';
 export { CalendarSync } from './calendar';
 export { EmailSync } from './email';
+export { FacebookObserver } from './facebook';
 
 /**
  * ObserverManager - Centralized coordinator for all observers

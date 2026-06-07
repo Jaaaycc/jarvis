@@ -32,6 +32,53 @@ const LOW_PRIORITY_DIRS = ['/tmp', '/var/tmp', '/dev/shm', 'node_modules', '.git
 export function classifyEvent(event: ObserverEvent): ClassifiedEvent {
   const { type, data } = event;
 
+  // --- Social media events (Facebook / Instagram) ---
+  if (type === 'social_dm' || type === 'social_ig_dm') {
+    const platform = type === 'social_ig_dm' ? 'Instagram' : 'Facebook';
+    return { event, priority: 'high', reason: `New ${platform} DM from ${data.senderName ?? 'someone'} — respond promptly` };
+  }
+
+  if (type === 'social_comment' || type === 'social_ig_comment') {
+    const platform = type === 'social_ig_comment' ? 'Instagram' : 'Facebook';
+    return { event, priority: 'normal', reason: `New ${platform} comment — queue reply` };
+  }
+
+  if (type === 'reel_creation_request') {
+    return { event, priority: 'high', reason: `Reel #${data.reelNumber} is due — Jacob needs to answer questions` };
+  }
+
+  if (type === 'reel_reminder') {
+    return { event, priority: 'normal', reason: `Daily Reel reminder: ${data.reelsPosted}/${data.target} posted` };
+  }
+
+  if (type === 'morning_briefing') {
+    return { event, priority: 'high', reason: 'Morning briefing — compile calendar, posts, and n8n status' };
+  }
+
+  if (type === 'ads_boost_suggestion') {
+    return { event, priority: 'normal', reason: `Jarvis found a boost-worthy post — asking Jacob for approval` };
+  }
+
+  if (type === 'ads_budget_adjusted') {
+    return { event, priority: 'normal', reason: `Ad budget recommendation: ${data.adSetName}` };
+  }
+
+  if (type === 'ad_auto_paused') {
+    return { event, priority: 'high', reason: `Ad paused (zero conversions): ${data.adName}` };
+  }
+
+  if (type === 'post_published') {
+    return { event, priority: 'low', reason: `Post published: ${data.title}` };
+  }
+
+  if (type === 'post_publish_failed') {
+    return { event, priority: 'high', reason: `Post publish FAILED: ${data.title} — ${data.error}` };
+  }
+
+  if (type === 'n8n_sync_tick') {
+    return { event, priority: 'low', reason: 'n8n workflow sync' };
+  }
+
   // --- Commitment-related events (injected by heartbeat checks) ---
   if (type === 'commitment_overdue') {
     return { event, priority: 'critical', reason: `Commitment overdue: ${data.what}` };

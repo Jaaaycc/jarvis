@@ -1345,24 +1345,6 @@ export function createApiRoutes(ctx: ApiContext): Record<string, unknown> {
     // Live model catalog for NVIDIA. NVIDIA's `/v1/models` is publicly
     // readable, so this works during onboarding before any key is stored.
     // We pass the user's key through when available so the call still
-    // authenticates if NVIDIA ever requires it. Mixes chat / embedding /
-    // vision models — the UI shows them all and relies on the connection
-    // test to weed out anything that can't speak /v1/chat/completions.
-    '/api/config/llm/nvidia/models': {
-      GET: async () => {
-        try {
-          const { NVIDIAProvider } = await import('../llm/nvidia.ts');
-          const key = ctx.config.llm.nvidia?.api_key ?? '';
-          const provider = new NVIDIAProvider(key);
-          const models = await provider.listModels();
-          return json({ ok: true, models });
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return json({ ok: false, error: msg, models: [] });
-        }
-      },
-    },
-
     // --- Roles ---
     '/api/roles': {
       GET: () => {
@@ -4368,7 +4350,7 @@ Return JSON with: { hook (first 3 seconds, shocking/curious), body (main content
             date: new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' }),
             n8nConfigured: !!(cfg.n8n?.api_key),
             facebookConfigured: !!(cfg.facebook?.page_access_token),
-            nvidiaConfigured: !!(cfg.nvidia?.api_key),
+            higgsfieldConfigured: !!(cfg.higgsfield?.api_key),
             message: `${greeting}, Jacob! Ready to grow ${company.name} today.`,
           });
         } catch (err) { return error(String(err), 500); }
@@ -4450,32 +4432,65 @@ Return JSON with: { hook (first 3 seconds, shocking/curious), body (main content
       },
     },
 
-    // ─── Video Generation Routes ──────────────────────────────────────
+    // ─── Media Generation Routes (Higgsfield) ────────────────────────
 
     '/api/videogen/generate': {
       POST: async (req: Request) => {
         try {
-          const body = await req.json() as { prompt: string; width?: number; height?: number };
+          const body = await req.json() as { prompt: string; image_url?: string; duration?: number; aspect_ratio?: string };
           const cfg = ctx.config as any;
-          const nvidiaKey = cfg.nvidia?.api_key ?? '';
+          const higgsfieldKey = cfg.higgsfield?.api_key ?? '';
 
-          if (nvidiaKey) {
+          if (higgsfieldKey) {
+            const { generateVideoFromText, generateVideoFromImage } = await import('../integrations/higgsfield.ts');
+            const hCfg = { apiKey: higgsfieldKey };
             try {
-              const r = await fetch('https://ai.api.nvidia.com/v1/genai/stabilityai/stable-video-diffusion', {
-                method: 'POST',
-                headers: { Authorization: `Bearer ${nvidiaKey}`, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ prompt: body.prompt, cfg_scale: 2.5, motion_bucket_id: 127 })
-              });
-              if (r.ok) {
-                const d = await r.json() as any;
-                return json({ videoUrl: d.video ?? d.url ?? null, provider: 'nvidia', ok: true });
+              let videoUrl: string;
+              if (body.image_url) {
+                videoUrl = await generateVideoFromImage(hCfg, {
+                  image_url: body.image_url,
+                  prompt: body.prompt,
+                  duration: body.duration ?? 5,
+                  aspect_ratio: (body.aspect_ratio as any) ?? '9:16',
+                });
+              } else {
+                videoUrl = await generateVideoFromText(hCfg, {
+                  prompt: body.prompt,
+                  duration: body.duration ?? 5,
+                  aspect_ratio: (body.aspect_ratio as any) ?? '9:16',
+                });
               }
-            } catch {}
+              return json({ videoUrl, provider: 'higgsfield', ok: true });
+            } catch (err) {
+              return json({ ok: false, error: String(err), provider: 'higgsfield' });
+            }
           }
 
+          // Fallback: image placeholder when no key is configured
           const encoded = encodeURIComponent(body.prompt);
-          const imageUrl = `https://image.pollinations.ai/prompt/${encoded}?width=${body.width ?? 1080}&height=${body.height ?? 1920}&seed=${Date.now()}&nologo=true`;
-          return json({ imageUrl, provider: 'pollinations', ok: true, note: 'Image placeholder — add NVIDIA API key for real video' });
+          const imageUrl = `https://image.pollinations.ai/prompt/${encoded}?width=1080&height=1920&seed=${Date.now()}&nologo=true`;
+          return json({ imageUrl, provider: 'pollinations', ok: true, note: 'Image placeholder — add Higgsfield API key at cloud.higgsfield.ai for real video' });
+        } catch (err) { return error(String(err), 500); }
+      },
+    },
+
+    '/api/videogen/generate-image': {
+      POST: async (req: Request) => {
+        try {
+          const body = await req.json() as { prompt: string; aspect_ratio?: string; resolution?: string; model?: string };
+          const cfg = ctx.config as any;
+          const higgsfieldKey = cfg.higgsfield?.api_key ?? '';
+
+          if (!higgsfieldKey) return json({ ok: false, error: 'Higgsfield API key not configured. Add it at cloud.higgsfield.ai' });
+
+          const { generateImage } = await import('../integrations/higgsfield.ts');
+          const imageUrl = await generateImage({ apiKey: higgsfieldKey }, {
+            prompt: body.prompt,
+            aspect_ratio: (body.aspect_ratio as any) ?? '1:1',
+            resolution: (body.resolution as any) ?? '720p',
+            model: body.model,
+          });
+          return json({ imageUrl, provider: 'higgsfield', ok: true });
         } catch (err) { return error(String(err), 500); }
       },
     },
@@ -4484,7 +4499,7 @@ Return JSON with: { hook (first 3 seconds, shocking/curious), body (main content
       GET: async () => {
         const cfg = ctx.config as any;
         return json({
-          nvidiaConfigured: !!(cfg.nvidia?.api_key),
+          higgsfieldConfigured: !!(cfg.higgsfield?.api_key),
           facebookConfigured: !!(cfg.facebook?.page_access_token),
         });
       },
@@ -4516,17 +4531,17 @@ Return JSON with: { hook (first 3 seconds, shocking/curious), body (main content
       },
     },
 
-    '/api/config/nvidia': {
+    '/api/config/higgsfield': {
       POST: async (req: Request) => {
         try {
           const body = await req.json() as { api_key: string };
           const { loadConfig, saveConfig } = await import('../config/loader.ts');
           const cfg = await loadConfig() as any;
-          if (!cfg.nvidia) cfg.nvidia = {};
-          cfg.nvidia.api_key = body.api_key;
+          if (!cfg.higgsfield) cfg.higgsfield = {};
+          cfg.higgsfield.api_key = body.api_key;
           await saveConfig(cfg);
-          (ctx.config as any).nvidia = cfg.nvidia;
-          return json({ ok: true, message: 'NVIDIA API key saved. Video Studio will now use NVIDIA for generation.' });
+          (ctx.config as any).higgsfield = cfg.higgsfield;
+          return json({ ok: true, message: 'Higgsfield API key saved. Video and image generation are now active.' });
         } catch (err) { return error(String(err), 500); }
       },
     },

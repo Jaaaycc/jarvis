@@ -88,9 +88,9 @@ function applyEnvOverrides(config: JarvisConfig): void {
     config.llm.openrouter.api_key = env.JARVIS_OPENROUTER_KEY;
   }
 
-  if (env.NVIDIA_API_KEY) {
-    if (!config.llm.nvidia) config.llm.nvidia = { api_key: '', model: 'meta/llama-3.3-70b-instruct' };
-    config.llm.nvidia.api_key = env.NVIDIA_API_KEY;
+  if (env.HIGGSFIELD_API_KEY) {
+    if (!config.higgsfield) config.higgsfield = { api_key: '' };
+    config.higgsfield.api_key = env.HIGGSFIELD_API_KEY;
   }
 
   if (env.JARVIS_LITELLM_URL || env.JARVIS_LITELLM_KEY) {

@@ -14,7 +14,6 @@ import { GroqProvider } from '../llm/groq.ts';
 import { GeminiProvider } from '../llm/gemini.ts';
 import { OllamaProvider } from '../llm/ollama.ts';
 import { OpenRouterProvider } from '../llm/openrouter.ts';
-import { NVIDIAProvider } from '../llm/nvidia.ts';
 import { OpenAICompatibleProvider } from '../llm/openai-compatible.ts';
 import { LiteLLMProvider } from '../llm/litellm.ts';
 import type { LLMProvider } from '../llm/provider.ts';
@@ -26,7 +25,6 @@ const KEY_OPENAI = 'llm.openai.api_key';
 const KEY_GROQ = 'llm.groq.api_key';
 const KEY_GEMINI = 'llm.gemini.api_key';
 const KEY_OPENROUTER = 'llm.openrouter.api_key';
-const KEY_NVIDIA = 'llm.nvidia.api_key';
 const KEY_OPENAI_COMPAT = 'llm.openai_compatible.api_key';
 const KEY_LITELLM = 'llm.litellm.api_key';
 
@@ -40,7 +38,6 @@ const SETTING_GEMINI_MODEL = 'llm.gemini.model';
 const SETTING_OLLAMA_MODEL = 'llm.ollama.model';
 const SETTING_OLLAMA_BASE_URL = 'llm.ollama.base_url';
 const SETTING_OPENROUTER_MODEL = 'llm.openrouter.model';
-const SETTING_NVIDIA_MODEL = 'llm.nvidia.model';
 const SETTING_OPENAI_COMPAT_MODEL = 'llm.openai_compatible.model';
 const SETTING_OPENAI_COMPAT_BASE_URL = 'llm.openai_compatible.base_url';
 const SETTING_LITELLM_MODEL = 'llm.litellm.model';
@@ -55,7 +52,6 @@ export type LLMSettingsResponse = {
   gemini: { model: string; has_api_key: boolean } | null;
   ollama: { base_url: string; model: string } | null;
   openrouter: { model: string; has_api_key: boolean } | null;
-  nvidia: { model: string; has_api_key: boolean } | null;
   openai_compatible: { base_url: string; model: string; has_api_key: boolean } | null;
   litellm: { base_url: string; model: string; has_api_key: boolean } | null;
 };
@@ -74,14 +70,12 @@ export function getLLMSettings(config: JarvisConfig): LLMSettingsResponse {
   const groqModel = getSetting(SETTING_GROQ_MODEL) ?? config.llm.groq?.model ?? 'llama-3.3-70b-versatile';
   const geminiModel = getSetting(SETTING_GEMINI_MODEL) ?? config.llm.gemini?.model ?? 'gemini-3-flash-preview';
   const openrouterModel = getSetting(SETTING_OPENROUTER_MODEL) ?? config.llm.openrouter?.model ?? 'anthropic/claude-sonnet-4';
-  const nvidiaModel = getSetting(SETTING_NVIDIA_MODEL) ?? config.llm.nvidia?.model ?? 'meta/llama-3.3-70b-instruct';
 
   const hasAnthropicKey = hasSecret(KEY_ANTHROPIC) || !!config.llm.anthropic?.api_key;
   const hasOpenaiKey = hasSecret(KEY_OPENAI) || !!config.llm.openai?.api_key;
   const hasGroqKey = hasSecret(KEY_GROQ) || !!config.llm.groq?.api_key;
   const hasGeminiKey = hasSecret(KEY_GEMINI) || !!config.llm.gemini?.api_key;
   const hasOpenrouterKey = hasSecret(KEY_OPENROUTER) || !!config.llm.openrouter?.api_key;
-  const hasNvidiaKey = hasSecret(KEY_NVIDIA) || !!config.llm.nvidia?.api_key;
 
   // Ollama is "configured" only when the user has explicitly set a base_url
   // (DB or env/yaml). Defaults alone shouldn't make it appear active in the UI.
@@ -133,7 +127,6 @@ export function getLLMSettings(config: JarvisConfig): LLMSettingsResponse {
     gemini: { model: geminiModel, has_api_key: hasGeminiKey },
     ollama,
     openrouter: { model: openrouterModel, has_api_key: hasOpenrouterKey },
-    nvidia: { model: nvidiaModel, has_api_key: hasNvidiaKey },
     openai_compatible,
     litellm,
   };
@@ -153,7 +146,6 @@ export function saveLLMSettings(
     gemini?: { api_key?: string; model?: string };
     ollama?: { base_url?: string; model?: string };
     openrouter?: { api_key?: string; model?: string };
-    nvidia?: { api_key?: string; model?: string };
     openai_compatible?: { base_url?: string; api_key?: string; model?: string };
     litellm?: { base_url?: string; api_key?: string; model?: string };
   },
@@ -281,21 +273,6 @@ export function saveLLMSettings(
     };
   }
 
-  // NVIDIA
-  if (body.nvidia) {
-    if (body.nvidia.model) {
-      setSetting(SETTING_NVIDIA_MODEL, body.nvidia.model);
-    }
-    if (body.nvidia.api_key) {
-      setSecret(KEY_NVIDIA, body.nvidia.api_key);
-    }
-    config.llm.nvidia = {
-      ...config.llm.nvidia,
-      model: body.nvidia.model ?? config.llm.nvidia?.model,
-      api_key: body.nvidia.api_key ?? getNvidiaApiKey(config) ?? '',
-    };
-  }
-
   // LiteLLM. Same independent-field model as openai_compatible — `base_url`,
   // `model`, and `api_key` can each be saved independently. An explicit
   // empty `base_url` clears the provider entirely.
@@ -400,13 +377,6 @@ function getGeminiApiKey(config: JarvisConfig): string | null {
  */
 function getOpenRouterApiKey(config: JarvisConfig): string | null {
   return getSecret(KEY_OPENROUTER) ?? config.llm.openrouter?.api_key ?? null;
-}
-
-/**
- * Resolve the NVIDIA API key: keychain > config.yaml > env var.
- */
-function getNvidiaApiKey(config: JarvisConfig): string | null {
-  return getSecret(KEY_NVIDIA) ?? config.llm.nvidia?.api_key ?? null;
 }
 
 /**
@@ -515,19 +485,6 @@ export function mergeLLMSettingsIntoConfig(config: JarvisConfig): void {
     };
   }
 
-  // NVIDIA
-  const dbNvidiaModel = getSetting(SETTING_NVIDIA_MODEL);
-  const keychainNvidiaKey = getSecret(KEY_NVIDIA);
-  if (dbNvidiaModel || keychainNvidiaKey) {
-    config.llm.nvidia = {
-      ...config.llm.nvidia,
-      api_key: (!process.env.NVIDIA_API_KEY && keychainNvidiaKey)
-        ? keychainNvidiaKey
-        : (config.llm.nvidia?.api_key ?? ''),
-      model: dbNvidiaModel ?? config.llm.nvidia?.model,
-    };
-  }
-
   // OpenAI-compatible
   const dbCompatModel = getSetting(SETTING_OPENAI_COMPAT_MODEL);
   const dbCompatUrl = getSetting(SETTING_OPENAI_COMPAT_BASE_URL);
@@ -588,10 +545,6 @@ export function hotReloadLLMProviders(config: JarvisConfig, llmManager: LLMManag
   if (llm.openrouter?.api_key) {
     providers.push(new OpenRouterProvider(llm.openrouter.api_key, llm.openrouter.model));
     console.log('[LLM] Hot-reloaded OpenRouter provider');
-  }
-  if (llm.nvidia?.api_key) {
-    providers.push(new NVIDIAProvider(llm.nvidia.api_key, llm.nvidia.model));
-    console.log('[LLM] Hot-reloaded NVIDIA provider');
   }
   if (llm.ollama?.base_url) {
     providers.push(new OllamaProvider(llm.ollama.base_url, llm.ollama.model));
@@ -655,10 +608,6 @@ export async function testLLMProvider(
       const key = opts.api_key || getSecret(KEY_OPENROUTER) || config.llm.openrouter?.api_key;
       if (!key) return { ok: false, error: 'API key required' };
       instance = new OpenRouterProvider(key, opts.model ?? config.llm.openrouter?.model);
-    } else if (opts.provider === 'nvidia') {
-      const key = opts.api_key || getSecret(KEY_NVIDIA) || config.llm.nvidia?.api_key;
-      if (!key) return { ok: false, error: 'API key required' };
-      instance = new NVIDIAProvider(key, opts.model ?? config.llm.nvidia?.model);
     } else if (opts.provider === 'ollama') {
       instance = new OllamaProvider(
         opts.base_url ?? config.llm.ollama?.base_url,

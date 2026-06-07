@@ -220,10 +220,10 @@ export type JarvisConfig = {
     gemini?: { api_key: string; model?: string };
     ollama?: { base_url?: string; model?: string };
     openrouter?: { api_key: string; model?: string };
-    nvidia?: { api_key: string; model?: string };
     openai_compatible?: { base_url?: string; api_key?: string; model?: string };
     litellm?: { base_url?: string; api_key?: string; model?: string };
   };
+  higgsfield?: { api_key: string };  // image & video generation
   personality: {
     core_traits: string[];
     assistant_name?: string;
@@ -319,11 +319,8 @@ export const DEFAULT_CONFIG: JarvisConfig = {
       api_key: '',
       model: 'anthropic/claude-sonnet-4',
     },
-    nvidia: {
-      api_key: '',
-      model: 'meta/llama-3.3-70b-instruct',
-    },
   },
+  higgsfield: { api_key: '' },
   personality: {
     core_traits: [
       'loyal',
